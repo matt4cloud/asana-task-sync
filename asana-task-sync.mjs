@@ -639,7 +639,9 @@ function plannedMcpCreate(state, task) {
 }
 
 function plannedMcpUpdate(state, task, result) {
-  const remoteNotes = splitNotes(state, result.observed.notes ?? '').operatorNotes;
+  const remoteNotes = result.observed.has_operator_heading
+    ? splitNotes(state, result.observed.notes ?? '').operatorNotes
+    : (task.asana.operator_notes ?? '');
   const desired = { ...result.desired, notes: renderNotes(state, task, remoteNotes) };
   return {
     local_id: task.id,
