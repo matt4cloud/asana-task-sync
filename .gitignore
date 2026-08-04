@@ -1,0 +1,23 @@
+# Dependencies and package-manager diagnostics
+node_modules/
+npm-debug.log*
+
+# Host configuration and secrets
+.env
+.env.*
+!.env.example
+*.local.env
+
+# Local agent directories
+.claude/*
+.codex/*
+
+# Runtime state belongs to the host workspace
+*.tmp-*
+*.log
+
+# Internal working documents (kept local, not published)
+/TECH_SCOPE.md
+/TODO.md
+/CHANGELOG.md
+/CLAUDE.md

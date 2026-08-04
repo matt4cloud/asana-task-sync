@@ -1,0 +1,28 @@
+{
+  "schema_version": "asana-mcp-snapshot/v1",
+  "captured_at": "2026-08-04T12:00:00.000Z",
+  "target": {
+    "project": { "gid": "project-123", "name": "Example project" }
+  },
+  "sections": [
+    { "gid": "section-todo", "name": "TO DO" },
+    { "gid": "section-done", "name": "DONE" }
+  ],
+  "scope": {
+    "kind": "section",
+    "section": { "gid": "section-todo", "name": "TO DO" }
+  },
+  "tasks": [
+    {
+      "gid": "task-789",
+      "name": "Example Asana task",
+      "notes": "Existing operator note",
+      "completed": false,
+      "due_on": null,
+      "modified_at": "2026-08-04T11:58:00.000Z",
+      "assignee": { "gid": "user-456", "email": null },
+      "section": { "gid": "section-todo", "name": "TO DO" }
+    }
+  ],
+  "bindings": []
+}

@@ -1,0 +1,108 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/asana-task-sync/asana-mcp-snapshot.schema.json",
+  "title": "Asana MCP snapshot v1",
+  "type": "object",
+  "required": ["schema_version", "captured_at", "target", "sections", "scope", "tasks"],
+  "properties": {
+    "schema_version": { "const": "asana-mcp-snapshot/v1" },
+    "captured_at": { "type": "string", "format": "date-time" },
+    "target": {
+      "type": "object",
+      "required": ["project"],
+      "properties": {
+        "project": { "$ref": "#/$defs/project" }
+      },
+      "additionalProperties": false
+    },
+    "sections": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/section" }
+    },
+    "scope": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["kind", "section"],
+          "properties": {
+            "kind": { "const": "section" },
+            "section": { "$ref": "#/$defs/section" }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["kind"],
+          "properties": { "kind": { "const": "tasks" } },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "tasks": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/task" }
+    },
+    "bindings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["local_id", "asana_gid"],
+        "properties": {
+          "local_id": { "type": "string", "minLength": 1 },
+          "asana_gid": { "type": "string", "minLength": 1 }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "project": {
+      "type": "object",
+      "required": ["gid", "name"],
+      "properties": {
+        "gid": { "type": "string", "minLength": 1 },
+        "name": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": false
+    },
+    "assignee": {
+      "type": "object",
+      "required": ["gid", "email"],
+      "properties": {
+        "gid": { "type": ["string", "null"], "minLength": 1 },
+        "email": { "type": ["string", "null"], "minLength": 1 }
+      },
+      "additionalProperties": false
+    },
+    "section": {
+      "type": "object",
+      "required": ["gid", "name"],
+      "properties": {
+        "gid": { "type": "string", "minLength": 1 },
+        "name": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": false
+    },
+    "task": {
+      "type": "object",
+      "required": ["gid", "name", "notes", "completed", "due_on", "modified_at", "section"],
+      "properties": {
+        "gid": { "type": "string", "minLength": 1 },
+        "name": { "type": "string", "minLength": 1 },
+        "notes": { "type": "string" },
+        "completed": { "type": "boolean" },
+        "due_on": { "type": ["string", "null"] },
+        "modified_at": { "type": ["string", "null"] },
+        "assignee": {
+          "oneOf": [
+            { "$ref": "#/$defs/assignee" },
+            { "type": "null" }
+          ]
+        },
+        "section": { "$ref": "#/$defs/section" }
+      },
+      "additionalProperties": false
+    }
+  }
+}

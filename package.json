@@ -1,0 +1,18 @@
+{
+  "name": "asana-task-sync",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Agent-operated JSON task-control synchronizer for Asana.",
+  "type": "module",
+  "bin": {
+    "asana-task-sync": "asana-task-sync.mjs"
+  },
+  "scripts": {
+    "check": "node --check asana-task-sync.mjs",
+    "test": "node --test tests/*.test.mjs",
+    "verify": "npm run check && npm test"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

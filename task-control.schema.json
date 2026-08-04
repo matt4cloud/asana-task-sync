@@ -1,0 +1,108 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:asana-task-sync:task-control:v1",
+  "title": "asana-task-sync task-control database",
+  "type": "object",
+  "required": ["schema_version", "sync", "rendering", "tasks"],
+  "properties": {
+    "schema_version": { "const": "asana-task-sync/v1" },
+    "sync": {
+      "type": "object",
+      "required": ["plan_fields"],
+      "properties": {
+        "plan_fields": {
+          "type": "array",
+          "minItems": 2,
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1 },
+          "allOf": [
+            { "contains": { "const": "id" } },
+            { "contains": { "const": "title" } }
+          ]
+        }
+      },
+      "additionalProperties": true
+    },
+    "rendering": {
+      "type": "object",
+      "required": [
+        "managed_notes_heading",
+        "operator_notes_heading",
+        "managed_fields"
+      ],
+      "properties": {
+        "managed_notes_heading": { "type": "string", "minLength": 1 },
+        "operator_notes_heading": { "type": "string", "minLength": 1 },
+        "managed_fields": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/managedField" }
+        }
+      },
+      "additionalProperties": true
+    },
+    "tasks": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/task" }
+    }
+  },
+  "$defs": {
+    "managedField": {
+      "type": "object",
+      "required": ["label", "path", "style", "format"],
+      "properties": {
+        "label": { "type": "string", "minLength": 1 },
+        "path": { "type": "string", "minLength": 1 },
+        "style": { "enum": ["inline", "block"] },
+        "format": { "enum": ["text", "list", "yes_no"] },
+        "omit_if_empty": { "type": "boolean" },
+        "empty_text": { "type": "string" },
+        "yes_text": { "type": "string" },
+        "no_text": { "type": "string" },
+        "blank_before": { "type": "boolean" },
+        "blank_after": { "type": "boolean" }
+      },
+      "additionalProperties": false
+    },
+    "task": {
+      "type": "object",
+      "required": ["id", "title", "asana"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "title": { "type": "string", "minLength": 1 },
+        "asana": { "$ref": "#/$defs/asanaState" }
+      },
+      "additionalProperties": true
+    },
+    "asanaState": {
+      "type": "object",
+      "required": [
+        "gid",
+        "section_gid",
+        "section_name",
+        "completed",
+        "due_on",
+        "operator_notes",
+        "last_seen_at",
+        "last_synced_plan_sha256",
+        "last_synced_projection_sha256",
+        "sync_status"
+      ],
+      "properties": {
+        "gid": { "type": ["string", "null"] },
+        "section_gid": { "type": ["string", "null"] },
+        "section_name": { "type": ["string", "null"] },
+        "assignee_gid": { "type": ["string", "null"] },
+        "assignee_email": { "type": ["string", "null"] },
+        "completed": { "type": "boolean" },
+        "due_on": { "type": ["string", "null"] },
+        "operator_notes": { "type": "string" },
+        "last_seen_at": { "type": ["string", "null"] },
+        "last_synced_plan_sha256": { "type": ["string", "null"] },
+        "last_synced_projection_sha256": { "type": ["string", "null"] },
+        "sync_status": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": true
+}
