@@ -376,6 +376,44 @@ test('pull plan does not write JSON and pull apply accepts an MCP snapshot', asy
   }
 });
 
+test('pull apply on a mixed base does not reject the receipt over not-yet-exported tasks', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'asana-task-sync-pull-mixed-'));
+  const statePath = join(directory, 'TASK_CONTROL.json');
+  const envPath = join(directory, 'TASK_CONTROL.env');
+  const controlState = attachRuntime(state());
+  const controlledTask = task();
+  const remote = remoteFromTask(controlState, controlledTask, 'Ręczna notatka operatora.');
+  establishBaseline(controlState, controlledTask, remote);
+  const notExportedTask = task({
+    id: 'task-2',
+    asana: {
+      gid: null, section_gid: null, section_name: null,
+      completed: false, due_on: null, operator_notes: '', last_seen_at: null,
+      last_synced_plan_sha256: null, last_synced_projection_sha256: null,
+      sync_status: 'not_exported',
+    },
+  });
+  controlState.tasks = [controlledTask, notExportedTask];
+  await writeFile(statePath, `${JSON.stringify(controlState, null, 2)}\n`, 'utf8');
+  const snapshotPath = await writeSnapshot(directory, snapshot([remote]));
+  const planReceiptPath = join(directory, 'pull-plan-receipt.json');
+
+  try {
+    const plan = await main([
+      'pull', '--plan', '--snapshot', snapshotPath, '--plan-receipt', planReceiptPath, '--env', envPath,
+    ], environment('TASK_CONTROL.json'));
+    assert.equal(plan.changed_json, false);
+    assert.equal(plan.tasks.some((entry) => entry.id === 'task-2' && entry.action === 'not_exported'), true);
+
+    const apply = await main([
+      'pull', '--apply', '--go', 'GO_PULL', '--snapshot', snapshotPath, '--plan-receipt', planReceiptPath, '--env', envPath,
+    ], environment('TASK_CONTROL.json'));
+    assert.equal(apply.changed_json, false);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test('pull and push apply require their preceding plan receipt', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'asana-task-sync-receipt-required-'));
   const statePath = join(directory, 'TASK_CONTROL.json');

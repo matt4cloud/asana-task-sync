@@ -833,7 +833,8 @@ async function readPlanReceipt(receiptPath, statePath, options, tasks) {
     || !Array.isArray(receipt.tasks)) {
     throw new Error('Plan receipt does not match this operation, state file, or selected task scope. Run a new --plan.');
   }
-  const expectedIds = new Set(tasks.map((task) => task.id));
+  const eligibleTasks = options.operation === 'pull' ? tasks.filter((task) => task.asana.gid) : tasks;
+  const expectedIds = new Set(eligibleTasks.map((task) => task.id));
   if (receipt.tasks.length !== expectedIds.size
     || receipt.tasks.some((task) => !expectedIds.has(task.id))) {
     throw new Error('Plan receipt task scope does not match the current selection. Run a new --plan.');
@@ -846,6 +847,7 @@ function planReceiptDiff(state, snapshot, options, tasks, receipt) {
   const remoteByGid = new Map(snapshot.remotes.map((remote) => [remote.gid, remote]));
   const diff = [];
   for (const task of tasks) {
+    if (options.operation === 'pull' && !task.asana.gid) continue;
     const planned = receiptById.get(task.id);
     const currentPlan = planPayload(state, task);
     diff.push(...projectionDiff(planned.plan_payload, currentPlan, 'planned_json', 'current_json')
