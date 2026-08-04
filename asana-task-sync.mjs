@@ -94,9 +94,12 @@ function taskSection(remote, projectGid) {
 }
 
 export function desiredProjection(state, task) {
+  const tracksParent = Object.hasOwn(task.asana, 'parent_gid');
+  const parentGid = tracksParent ? (task.asana.parent_gid ?? null) : null;
+  const isSubtask = Boolean(parentGid);
   const sectionGid = task.asana.section_gid;
   const sectionName = task.asana.section_name;
-  if (!sectionGid || !sectionName) {
+  if (!isSubtask && (!sectionGid || !sectionName)) {
     throw new Error(`Task ${task.id} requires an explicit asana.section_gid and asana.section_name before push.`);
   }
   const projection = {
@@ -104,11 +107,14 @@ export function desiredProjection(state, task) {
     notes: renderNotes(state, task, task.asana.operator_notes ?? ''),
     due_on: task.asana.due_on ?? null,
     completed: Boolean(task.asana.completed),
-    section_gid: sectionGid,
-    section_name: sectionName,
+    section_gid: isSubtask ? null : sectionGid,
+    section_name: isSubtask ? null : sectionName,
   };
   if (Object.hasOwn(task.asana, 'assignee_gid')) {
     projection.assignee_gid = task.asana.assignee_gid ?? null;
+  }
+  if (tracksParent) {
+    projection.parent_gid = parentGid;
   }
   return projection;
 }
@@ -123,6 +129,7 @@ export function remoteProjection(state, task, remote) {
     completed: Boolean(remote.completed),
     section_gid: section.gid,
     section_name: section.name,
+    parent_gid: remote.parent?.gid ?? null,
     assignee_gid: remote.assignee?.gid ?? null,
     assignee_email: remote.assignee?.email ?? null,
     operator_notes: notes.operatorNotes,
@@ -148,10 +155,11 @@ function projectionHash(projection) {
     section_name: projection.section_name,
   };
   if (Object.hasOwn(projection, 'assignee_gid')) value.assignee_gid = projection.assignee_gid;
+  if (Object.hasOwn(projection, 'parent_gid')) value.parent_gid = projection.parent_gid;
   return sha256(value);
 }
 
-function observedHash(observed, tracksAssignee = false) {
+function observedHash(observed, tracksAssignee = false, tracksParent = false) {
   const value = {
     name: observed.name,
     notes: observed.notes,
@@ -161,6 +169,7 @@ function observedHash(observed, tracksAssignee = false) {
     section_name: observed.section_name,
   };
   if (tracksAssignee) value.assignee_gid = observed.assignee_gid;
+  if (tracksParent) value.parent_gid = observed.parent_gid;
   return sha256(value);
 }
 
@@ -173,10 +182,11 @@ function comparableDesiredProjection(desired) {
     section_gid: desired.section_gid,
     section_name: desired.section_name,
     ...(Object.hasOwn(desired, 'assignee_gid') ? { assignee_gid: desired.assignee_gid } : {}),
+    ...(Object.hasOwn(desired, 'parent_gid') ? { parent_gid: desired.parent_gid } : {}),
   };
 }
 
-function comparableObservedProjection(observed, tracksAssignee = false) {
+function comparableObservedProjection(observed, tracksAssignee = false, tracksParent = false) {
   return {
     name: observed.name,
     notes: observed.notes,
@@ -185,6 +195,7 @@ function comparableObservedProjection(observed, tracksAssignee = false) {
     section_gid: observed.section_gid,
     section_name: observed.section_name,
     ...(tracksAssignee ? { assignee_gid: observed.assignee_gid } : {}),
+    ...(tracksParent ? { parent_gid: observed.parent_gid } : {}),
   };
 }
 
@@ -204,7 +215,9 @@ export function classifyKnownTask(state, task, remote) {
   const observed = remoteProjection(state, task, remote);
   const planHash = sha256(planPayload(state, task));
   const desiredHash = projectionHash(desired);
-  const remoteHash = observedHash(observed, Object.hasOwn(task.asana, 'assignee_gid'));
+  const remoteHash = observedHash(
+    observed, Object.hasOwn(task.asana, 'assignee_gid'), Object.hasOwn(task.asana, 'parent_gid'),
+  );
   const baselinePlan = task.asana.last_synced_plan_sha256;
   const baselineProjection = task.asana.last_synced_projection_sha256;
   const controlledMatches = controlledProjectionMatches(state, task, observed);
@@ -255,6 +268,7 @@ function applyObservedAsanaState(task, result) {
   const { observed, planHash, remoteHash } = result;
   task.asana.section_gid = observed.section_gid;
   task.asana.section_name = observed.section_name;
+  task.asana.parent_gid = observed.parent_gid;
   task.asana.completed = observed.completed;
   task.asana.due_on = observed.due_on;
   task.asana.operator_notes = observed.operator_notes;
@@ -262,7 +276,7 @@ function applyObservedAsanaState(task, result) {
   task.asana.assignee_email = observed.assignee_email;
   task.asana.last_seen_at = observed.modified_at;
   task.asana.last_synced_plan_sha256 = planHash;
-  task.asana.last_synced_projection_sha256 = observedHash(observed, true);
+  task.asana.last_synced_projection_sha256 = observedHash(observed, true, true);
   task.asana.sync_status = 'synchronized';
 }
 
@@ -270,6 +284,7 @@ function applyDesiredAsanaState(state, task, result, remote) {
   const desired = result.desired;
   task.asana.section_gid = desired.section_gid;
   task.asana.section_name = desired.section_name;
+  task.asana.parent_gid = remote.parent?.gid ?? null;
   task.asana.completed = desired.completed;
   task.asana.due_on = desired.due_on;
   task.asana.operator_notes = splitNotes(state, remote.notes ?? '').operatorNotes;
@@ -293,10 +308,10 @@ function snapshotRemoteTask(task, projectGid) {
       gid: task.assignee?.gid ?? null,
       email: task.assignee?.email ?? null,
     },
-    memberships: [{
-      project: { gid: projectGid },
-      section: { gid: task.section.gid, name: task.section.name },
-    }],
+    memberships: task.section
+      ? [{ project: { gid: projectGid }, section: { gid: task.section.gid, name: task.section.name } }]
+      : [],
+    parent: task.parent ? { gid: task.parent.gid, name: task.parent.name } : null,
   };
 }
 
@@ -336,10 +351,16 @@ function validateMcpSnapshot(snapshot, state) {
         requireSnapshotText(task.assignee.email, `tasks[${index}].assignee.email`);
       }
     }
-    requireSnapshotText(task?.section?.gid, `tasks[${index}].section.gid`);
-    requireSnapshotText(task?.section?.name, `tasks[${index}].section.name`);
-    if (!sectionGids.has(task.section.gid)) {
-      throw new Error(`MCP snapshot task ${task.gid} references a section outside the snapshot.`);
+    const hasParent = task?.parent !== null && task?.parent !== undefined;
+    if (hasParent) {
+      requireSnapshotText(task.parent.gid, `tasks[${index}].parent.gid`);
+      requireSnapshotText(task.parent.name, `tasks[${index}].parent.name`);
+    } else {
+      requireSnapshotText(task?.section?.gid, `tasks[${index}].section.gid`);
+      requireSnapshotText(task?.section?.name, `tasks[${index}].section.name`);
+      if (!sectionGids.has(task.section.gid)) {
+        throw new Error(`MCP snapshot task ${task.gid} references a section outside the snapshot.`);
+      }
     }
     return snapshotRemoteTask(task, state.asana_target.project_gid);
   });
@@ -551,7 +572,11 @@ function reportEntry(task, result) {
     reason: result.reason,
     diff: projectionDiff(
       comparableDesiredProjection(result.desired),
-      comparableObservedProjection(result.observed, Object.hasOwn(task.asana, 'assignee_gid')),
+      comparableObservedProjection(
+        result.observed,
+        Object.hasOwn(task.asana, 'assignee_gid'),
+        Object.hasOwn(task.asana, 'parent_gid'),
+      ),
       'json', 'asana',
     ),
   };
@@ -573,13 +598,14 @@ function selectTasks(state, taskSelector) {
 
 function receiptTask(state, task, result) {
   const tracksAssignee = Object.hasOwn(task.asana, 'assignee_gid');
+  const tracksParent = Object.hasOwn(task.asana, 'parent_gid');
   return {
     id: task.id,
     asana_gid: task.asana.gid,
     action: result.kind,
     plan_payload: planPayload(state, task),
     desired: comparableDesiredProjection(result.desired),
-    observed: comparableObservedProjection(result.observed, tracksAssignee),
+    observed: comparableObservedProjection(result.observed, tracksAssignee, tracksParent),
   };
 }
 
@@ -623,17 +649,19 @@ function plannedMcpCreate(state, task) {
       `Task ${task.id} requires an explicit asana.assignee_gid or paired ASANA_NEW_TASK_DEFAULT_ASSIGNEE_GID and ASANA_NEW_TASK_DEFAULT_ASSIGNEE_EMAIL before creation.`,
     );
   }
+  const isSubtask = Object.hasOwn(desired, 'parent_gid') && Boolean(desired.parent_gid);
   return {
     local_id: task.id,
     operation: 'create_task',
     task: {
       name: desired.name,
       notes: desired.notes,
-      project_id: state.asana_target.project_gid,
-      section_id: desired.section_gid,
       due_on: desired.due_on,
       completed: desired.completed,
       assignee,
+      ...(isSubtask
+        ? { parent: desired.parent_gid }
+        : { project_id: state.asana_target.project_gid, section_id: desired.section_gid }),
     },
   };
 }
@@ -643,6 +671,7 @@ function plannedMcpUpdate(state, task, result) {
     ? splitNotes(state, result.observed.notes ?? '').operatorNotes
     : (task.asana.operator_notes ?? '');
   const desired = { ...result.desired, notes: renderNotes(state, task, remoteNotes) };
+  const isSubtask = Object.hasOwn(desired, 'parent_gid') && Boolean(desired.parent_gid);
   return {
     local_id: task.id,
     operation: 'update_task',
@@ -652,8 +681,9 @@ function plannedMcpUpdate(state, task, result) {
       notes: desired.notes,
       due_on: desired.due_on,
       completed: desired.completed,
-      section_id: desired.section_gid,
+      ...(isSubtask ? {} : { section_id: desired.section_gid }),
       ...(Object.hasOwn(desired, 'assignee_gid') ? { assignee: desired.assignee_gid } : {}),
+      ...(Object.hasOwn(desired, 'parent_gid') ? { parent: desired.parent_gid } : {}),
     },
   };
 }
@@ -688,7 +718,8 @@ function mcpReceiptMatchesDesired(state, task, remote) {
     && observed.completed === desired.completed
     && observed.section_gid === desired.section_gid
     && observed.section_name === desired.section_name
-    && (!Object.hasOwn(desired, 'assignee_gid') || observed.assignee_gid === desired.assignee_gid);
+    && (!Object.hasOwn(desired, 'assignee_gid') || observed.assignee_gid === desired.assignee_gid)
+    && (!Object.hasOwn(desired, 'parent_gid') || observed.parent_gid === desired.parent_gid);
 }
 
 function push(state, snapshot, apply, tasks, resolution) {
@@ -745,7 +776,9 @@ function push(state, snapshot, apply, tasks, resolution) {
         id: task.id, asana_gid: remoteGid, action: 'receipt_mismatch',
         reason: 'mcp_snapshot_does_not_match_the_desired_controlled_projection',
         diff: projectionDiff(comparableDesiredProjection(desired), comparableObservedProjection(
-          observed, Object.hasOwn(taskForComparison.asana, 'assignee_gid'),
+          observed,
+          Object.hasOwn(taskForComparison.asana, 'assignee_gid'),
+          Object.hasOwn(taskForComparison.asana, 'parent_gid'),
         ), 'planned', 'asana'),
       });
       continue;
@@ -814,7 +847,9 @@ function planReceiptDiff(state, snapshot, options, tasks, receipt) {
       continue;
     }
     const currentObserved = comparableObservedProjection(
-      remoteProjection(state, task, remote), Object.hasOwn(task.asana, 'assignee_gid'),
+      remoteProjection(state, task, remote),
+      Object.hasOwn(task.asana, 'assignee_gid'),
+      Object.hasOwn(task.asana, 'parent_gid'),
     );
     diff.push(...projectionDiff(planned.observed, currentObserved, 'planned_asana', 'current_asana')
       .map((entry) => ({ id: task.id, source: 'asana', ...entry })));

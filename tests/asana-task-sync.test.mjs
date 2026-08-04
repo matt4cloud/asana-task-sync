@@ -120,6 +120,31 @@ function snapshot(tasks, scope = { kind: 'tasks' }, bindings = []) {
   };
 }
 
+function snapshotSubtask(remote) {
+  return {
+    gid: remote.gid,
+    name: remote.name,
+    notes: remote.notes,
+    completed: remote.completed,
+    due_on: remote.due_on,
+    modified_at: remote.modified_at,
+    assignee: { ...target.assignee },
+    parent: { ...remote.parent },
+  };
+}
+
+function snapshotWithParent(tasks, scope = { kind: 'tasks' }, bindings = []) {
+  return {
+    schema_version: 'asana-mcp-snapshot/v1',
+    captured_at: '2026-08-04T10:00:00.000Z',
+    target,
+    sections,
+    scope,
+    tasks: tasks.map(snapshotSubtask),
+    bindings,
+  };
+}
+
 function environment(stateFile) {
   return {
     ASANA_PROJECT_NAME: target.project.name,
@@ -561,6 +586,97 @@ test('a new task own assignment overrides the fallback and an explicit null stay
     await writeFile(statePath, `${JSON.stringify(controlState, null, 2)}\n`, 'utf8');
     const unassignedPlan = await main(['push', '--plan', '--snapshot', snapshotPath, '--env', envPath], environment('TASK_CONTROL.json'));
     assert.equal(unassignedPlan.mcp_operations[0].task.assignee, null);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('a new subtask is created under its parent instead of a project section', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'asana-task-sync-create-subtask-'));
+  const statePath = join(directory, 'TASK_CONTROL.json');
+  const envPath = join(directory, 'TASK_CONTROL.env');
+  const subtask = task({
+    id: 'subtask-1',
+    title: 'Subtask of the plan',
+    asana: {
+      ...task().asana,
+      gid: null,
+      section_gid: null,
+      section_name: null,
+      parent_gid: 'parent-asana-1',
+    },
+  });
+  const controlState = state([subtask]);
+  await writeFile(statePath, `${JSON.stringify(controlState, null, 2)}\n`, 'utf8');
+  const snapshotPath = await writeSnapshot(directory, snapshot([]));
+
+  try {
+    const plan = await main(['push', '--plan', '--snapshot', snapshotPath, '--env', envPath], environment('TASK_CONTROL.json'));
+    assert.equal(plan.tasks[0].action, 'create_required');
+    assert.equal(plan.mcp_operations[0].task.parent, 'parent-asana-1');
+    assert.equal(plan.mcp_operations[0].task.project_id, undefined);
+    assert.equal(plan.mcp_operations[0].task.section_id, undefined);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('push plan and apply reconcile an existing subtask through its parent, not a section', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'asana-task-sync-push-subtask-'));
+  const statePath = join(directory, 'TASK_CONTROL.json');
+  const envPath = join(directory, 'TASK_CONTROL.env');
+  const controlState = attachRuntime(state());
+  const subtask = task({
+    id: 'subtask-1',
+    title: 'Subtask of the plan',
+    asana: { ...task().asana, section_gid: null, section_name: null, parent_gid: 'parent-asana-1' },
+  });
+  const baselineRemote = {
+    gid: subtask.asana.gid,
+    name: `[demo] ${subtask.title}`,
+    notes: renderNotes(controlState, subtask, ''),
+    completed: false,
+    due_on: null,
+    modified_at: '2026-08-04T10:00:00.000Z',
+    parent: { gid: 'parent-asana-1', name: 'Parent task' },
+  };
+  subtask.asana.last_synced_plan_sha256 = sha256(planPayload(controlState, subtask));
+  subtask.asana.last_synced_projection_sha256 = sha256({
+    name: baselineRemote.name,
+    notes: baselineRemote.notes,
+    due_on: baselineRemote.due_on,
+    completed: baselineRemote.completed,
+    section_gid: null,
+    section_name: null,
+    parent_gid: 'parent-asana-1',
+  });
+  subtask.title = 'Synchronize the revised subtask plan';
+  controlState.tasks = [subtask];
+  await writeFile(statePath, `${JSON.stringify(controlState, null, 2)}\n`, 'utf8');
+  const planSnapshotPath = await writeSnapshot(directory, snapshotWithParent([baselineRemote]));
+  const planReceiptPath = join(directory, 'push-subtask-plan-receipt.json');
+
+  try {
+    const plan = await main([
+      'push', '--plan', '--snapshot', planSnapshotPath, '--plan-receipt', planReceiptPath, '--env', envPath,
+    ], environment('TASK_CONTROL.json'));
+    assert.equal(plan.tasks[0].action, 'push_required');
+    assert.equal(plan.mcp_operations[0].changes.parent, 'parent-asana-1');
+    assert.equal(plan.mcp_operations[0].changes.section_id, undefined);
+
+    const updatedRemote = {
+      ...baselineRemote,
+      name: `[demo] ${subtask.title}`,
+      notes: renderNotes(controlState, subtask, ''),
+    };
+    const receiptPath = await writeSnapshot(directory, snapshotWithParent([updatedRemote]));
+    const applied = await main([
+      'push', '--apply', '--go', 'GO_PUSH', '--snapshot', receiptPath, '--plan-receipt', planReceiptPath, '--env', envPath,
+    ], environment('TASK_CONTROL.json'));
+    assert.equal(applied.changed_json, true);
+    const saved = JSON.parse(await readFile(statePath, 'utf8'));
+    assert.equal(saved.tasks[0].asana.parent_gid, 'parent-asana-1');
+    assert.equal(saved.tasks[0].asana.sync_status, 'synchronized');
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

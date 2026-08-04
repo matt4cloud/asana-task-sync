@@ -9,8 +9,7 @@
     { "gid": "section-done", "name": "DONE" }
   ],
   "scope": {
-    "kind": "section",
-    "section": { "gid": "section-todo", "name": "TO DO" }
+    "kind": "tasks"
   },
   "tasks": [
     {
@@ -22,6 +21,16 @@
       "modified_at": "2026-08-04T11:58:00.000Z",
       "assignee": { "gid": "user-456", "email": null },
       "section": { "gid": "section-todo", "name": "TO DO" }
+    },
+    {
+      "gid": "task-790",
+      "name": "Example subtask",
+      "notes": "",
+      "completed": false,
+      "due_on": null,
+      "modified_at": "2026-08-04T11:58:00.000Z",
+      "assignee": { "gid": "user-456", "email": null },
+      "parent": { "gid": "task-789", "name": "Example Asana task" }
     }
   ],
   "bindings": []

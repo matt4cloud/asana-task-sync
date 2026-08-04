@@ -93,6 +93,7 @@
         "section_name": { "type": ["string", "null"] },
         "assignee_gid": { "type": ["string", "null"] },
         "assignee_email": { "type": ["string", "null"] },
+        "parent_gid": { "type": ["string", "null"] },
         "completed": { "type": "boolean" },
         "due_on": { "type": ["string", "null"] },
         "operator_notes": { "type": "string" },

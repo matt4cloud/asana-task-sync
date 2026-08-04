@@ -71,6 +71,32 @@
         "last_synced_projection_sha256": null,
         "sync_status": "not_exported"
       }
+    },
+    {
+      "id": "collect-source-data",
+      "title": "Collect source data",
+      "goal": "Gather every input the report draft depends on.",
+      "steps": [
+        "List required sources"
+      ],
+      "acceptance": [
+        "Every source is confirmed available"
+      ],
+      "asana": {
+        "gid": null,
+        "section_gid": null,
+        "section_name": null,
+        "parent_gid": null,
+        "assignee_gid": null,
+        "assignee_email": null,
+        "completed": false,
+        "due_on": null,
+        "operator_notes": "",
+        "last_seen_at": null,
+        "last_synced_plan_sha256": null,
+        "last_synced_projection_sha256": null,
+        "sync_status": "not_exported"
+      }
     }
   ]
 }
