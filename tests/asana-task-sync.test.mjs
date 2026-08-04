@@ -498,6 +498,50 @@ test('a task selector scopes a plan to one task and accepts a matching partial s
   }
 });
 
+test('a comma-separated task selector scopes a plan to exactly that subset', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'asana-task-sync-multi-task-'));
+  const statePath = join(directory, 'TASK_CONTROL.json');
+  const envPath = join(directory, 'TASK_CONTROL.env');
+  const controlState = attachRuntime(state());
+  const first = task();
+  const second = task({ id: 'task-2', asana: { ...task().asana, gid: 'asana-2' } });
+  const third = task({ id: 'task-3', asana: { ...task().asana, gid: 'asana-3' } });
+  const firstRemote = remoteFromTask(controlState, first);
+  const secondRemote = remoteFromTask(controlState, second);
+  const thirdRemote = remoteFromTask(controlState, third);
+  establishBaseline(controlState, first, firstRemote);
+  establishBaseline(controlState, second, secondRemote);
+  establishBaseline(controlState, third, thirdRemote);
+  controlState.tasks = [first, second, third];
+  await writeFile(statePath, `${JSON.stringify(controlState, null, 2)}\n`, 'utf8');
+  const snapshotPath = await writeSnapshot(directory, snapshot([firstRemote, secondRemote, thirdRemote]));
+  const planReceiptPath = join(directory, 'multi-task-plan-receipt.json');
+
+  try {
+    const report = await main([
+      'pull', '--plan', '--task', 'task-1,task-3', '--snapshot', snapshotPath,
+      '--plan-receipt', planReceiptPath, '--env', envPath,
+    ], environment('TASK_CONTROL.json'));
+    assert.equal(report.tasks.length, 2);
+    assert.deepEqual(report.tasks.map((entry) => entry.id).sort(), ['task-1', 'task-3']);
+
+    await assert.rejects(
+      main([
+        'pull', '--plan', '--task', 'task-1,task-unknown', '--snapshot', snapshotPath, '--env', envPath,
+      ], environment('TASK_CONTROL.json')),
+      /No task matches --task task-unknown/,
+    );
+
+    const deduped = await main([
+      'pull', '--plan', '--task', 'task-1,task-1,asana-1', '--snapshot', snapshotPath, '--env', envPath,
+    ], environment('TASK_CONTROL.json'));
+    assert.equal(deduped.tasks.length, 1);
+    assert.equal(deduped.tasks[0].id, 'task-1');
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test('pull apply stops with a decision diff when Asana changed after the plan', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'asana-task-sync-plan-drift-'));
   const statePath = join(directory, 'TASK_CONTROL.json');

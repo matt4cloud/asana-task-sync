@@ -584,16 +584,29 @@ function reportEntry(task, result) {
 
 function selectTasks(state, taskSelector) {
   if (!taskSelector) return state.tasks;
-  const matches = state.tasks.filter((task) => (
-    task.id === taskSelector || task.asana.gid === taskSelector
-  ));
-  if (matches.length === 0) {
-    throw new Error(`No task matches --task ${taskSelector}. Use its stable local id or Asana GID.`);
+  const selectors = taskSelector.split(',').map((value) => value.trim()).filter(Boolean);
+  if (selectors.length === 0) {
+    throw new Error('--task requires at least one non-empty, comma-separated local id or Asana GID.');
   }
-  if (matches.length > 1) {
-    throw new Error(`--task ${taskSelector} is ambiguous. Use the stable local id.`);
+  const selected = [];
+  const seenIds = new Set();
+  for (const selector of selectors) {
+    const matches = state.tasks.filter((task) => (
+      task.id === selector || task.asana.gid === selector
+    ));
+    if (matches.length === 0) {
+      throw new Error(`No task matches --task ${selector}. Use its stable local id or Asana GID.`);
+    }
+    if (matches.length > 1) {
+      throw new Error(`--task ${selector} is ambiguous. Use the stable local id.`);
+    }
+    const [task] = matches;
+    if (!seenIds.has(task.id)) {
+      seenIds.add(task.id);
+      selected.push(task);
+    }
   }
-  return matches;
+  return selected;
 }
 
 function receiptTask(state, task, result) {
@@ -1052,7 +1065,7 @@ function assertInstancePair(statePath, envPath) {
 export async function main(argv = process.argv.slice(2), baseEnvironment = process.env) {
   const options = parseArguments(argv);
   if (options.help) {
-    process.stdout.write(`Użycie:\n  asana-task-sync validate [--state PATH] --env NAME_TASK_CONTROL.env\n  asana-task-sync import <--plan|--apply> --name NAME --output-dir PATH --section SECTION_NAME --snapshot SNAPSHOT.json [--go GO] --env NAME_TASK_CONTROL.env\n  asana-task-sync <pull|push> --plan --snapshot SNAPSHOT.json [--task LOCAL_ID_OR_ASANA_GID] [--plan-receipt PLAN.json] [--resolve json] [--state PATH] --env NAME_TASK_CONTROL.env\n  asana-task-sync <pull|push> --apply --go GO --snapshot SNAPSHOT.json --plan-receipt PLAN.json [--task LOCAL_ID_OR_ASANA_GID] [--resolve json] [--state PATH] --env NAME_TASK_CONTROL.env\n\nTryby:\n  validate       waliduje bazę JSON bez zrzutu Asany\n  import --plan  wykrywa zadania istniejące w zrzucie MCP bez zapisu\n  import --apply tworzy lub uzupełnia NAME_TASK_CONTROL.json po GO\n  pull --plan    klasyfikuje różnice z MCP snapshot bez zapisu; opcjonalnie zapisuje receipt\n  pull --apply   porównuje świeży snapshot z receipt; przy różnicy zwraca diff i nie zapisuje JSON-a\n  push --plan    generuje manifest operacji MCP wymaganych w Asanie; opcjonalnie zapisuje receipt\n  push --apply   potwierdza w JSON-ie operacje już wykonane przez MCP i sprawdza niezmienność lokalnego planu\n\nKonfiguracja:\n  NAME jest prefiksem bez _TASK_CONTROL, np. PROJECT albo PROJECT_X.\n  --env jest wymagany i musi wskazywać sąsiedni plik NAME_TASK_CONTROL.env poza katalogiem narzędzia.\n  --task ogranicza pull lub push do dokładnie jednego stabilnego lokalnego ID albo GID Asany.\n  --plan-receipt jest opcjonalnym artefaktem --plan i wymaganym wejściem późniejszego pull/push --apply.\n  --resolve json jest jawną decyzją operatora, że JSON wygrywa wcześniej wykryty konflikt kontrolowanej projekcji.\n  --section jest wymaganą, jawną nazwą źródłowej tablicy Asany dla importu.\n  --snapshot pochodzi z MCP Asany skonfigurowanego dla bieżącego agenta i leży poza katalogiem narzędzia.\n`);
+    process.stdout.write(`Użycie:\n  asana-task-sync validate [--state PATH] --env NAME_TASK_CONTROL.env\n  asana-task-sync import <--plan|--apply> --name NAME --output-dir PATH --section SECTION_NAME --snapshot SNAPSHOT.json [--go GO] --env NAME_TASK_CONTROL.env\n  asana-task-sync <pull|push> --plan --snapshot SNAPSHOT.json [--task LOCAL_ID_OR_ASANA_GID[,LOCAL_ID_OR_ASANA_GID...]] [--plan-receipt PLAN.json] [--resolve json] [--state PATH] --env NAME_TASK_CONTROL.env\n  asana-task-sync <pull|push> --apply --go GO --snapshot SNAPSHOT.json --plan-receipt PLAN.json [--task LOCAL_ID_OR_ASANA_GID[,LOCAL_ID_OR_ASANA_GID...]] [--resolve json] [--state PATH] --env NAME_TASK_CONTROL.env\n\nTryby:\n  validate       waliduje bazę JSON bez zrzutu Asany\n  import --plan  wykrywa zadania istniejące w zrzucie MCP bez zapisu\n  import --apply tworzy lub uzupełnia NAME_TASK_CONTROL.json po GO\n  pull --plan    klasyfikuje różnice z MCP snapshot bez zapisu; opcjonalnie zapisuje receipt\n  pull --apply   porównuje świeży snapshot z receipt; przy różnicy zwraca diff i nie zapisuje JSON-a\n  push --plan    generuje manifest operacji MCP wymaganych w Asanie; opcjonalnie zapisuje receipt\n  push --apply   potwierdza w JSON-ie operacje już wykonane przez MCP i sprawdza niezmienność lokalnego planu\n\nKonfiguracja:\n  NAME jest prefiksem bez _TASK_CONTROL, np. PROJECT albo PROJECT_X.\n  --env jest wymagany i musi wskazywać sąsiedni plik NAME_TASK_CONTROL.env poza katalogiem narzędzia.\n  --task ogranicza pull lub push do jednego lub kilku stabilnych lokalnych ID albo GID Asany, rozdzielonych przecinkiem.\n  --plan-receipt jest opcjonalnym artefaktem --plan i wymaganym wejściem późniejszego pull/push --apply.\n  --resolve json jest jawną decyzją operatora, że JSON wygrywa wcześniej wykryty konflikt kontrolowanej projekcji.\n  --section jest wymaganą, jawną nazwą źródłowej tablicy Asany dla importu.\n  --snapshot pochodzi z MCP Asany skonfigurowanego dla bieżącego agenta i leży poza katalogiem narzędzia.\n`);
     return { help: true };
   }
   assertOutsideToolDirectory(options.envPath, 'Instance environment');
