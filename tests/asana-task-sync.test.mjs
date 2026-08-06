@@ -265,6 +265,43 @@ test('classification detects one-sided and simultaneous changes', () => {
   assert.equal(sha256(planPayload(controlState, controlledTask)).length, 64);
 });
 
+test('classification treats a stale baseline with matching projections as a pull', () => {
+  const controlState = attachRuntime(state());
+  const controlledTask = task();
+  const remote = remoteFromTask(controlState, controlledTask);
+  establishBaseline(controlState, controlledTask, remote);
+
+  controlledTask.asana.completed = true;
+  controlledTask.asana.section_gid = 'section-done';
+  controlledTask.asana.section_name = 'DONE';
+  remote.completed = true;
+  remote.memberships[0].section = { gid: 'section-done', name: 'DONE' };
+
+  const matching = classifyKnownTask(controlState, controlledTask, remote);
+  assert.equal(matching.kind, 'pull_required');
+  assert.equal(matching.reason, 'baseline_stale_but_projections_match');
+
+  remote.due_on = '2026-08-05';
+  const diverging = classifyKnownTask(controlState, controlledTask, remote);
+  assert.equal(diverging.kind, 'conflict');
+  assert.equal(diverging.reason, 'both_sides_changed_since_baseline');
+});
+
+test('classification keeps a locally changed plan a conflict even when projections match', () => {
+  const controlState = attachRuntime(state());
+  const controlledTask = task();
+  const remote = remoteFromTask(controlState, controlledTask);
+  establishBaseline(controlState, controlledTask, remote);
+
+  controlledTask.title = 'Locally changed plan';
+  remote.name = '[demo] Locally changed plan';
+
+  const result = classifyKnownTask(controlState, controlledTask, remote);
+  assert.equal(result.desiredHash, result.remoteHash);
+  assert.equal(result.kind, 'conflict');
+  assert.equal(result.reason, 'both_sides_changed_since_baseline');
+});
+
 test('import plan uses a section-scoped MCP snapshot without creating JSON', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'asana-task-sync-import-plan-'));
   const statePath = join(directory, 'GENERAL_TASK_CONTROL.json');

@@ -235,6 +235,12 @@ export function classifyKnownTask(state, task, remote) {
   const remoteProjectionChanged = remoteHash !== baselineProjection;
 
   if ((localPlanChanged || localProjectionChanged) && remoteProjectionChanged) {
+    if (!localPlanChanged && desiredHash === remoteHash) {
+      return {
+        kind: 'pull_required', reason: 'baseline_stale_but_projections_match',
+        planHash, desiredHash, remoteHash, desired, observed,
+      };
+    }
     return {
       kind: 'conflict', reason: 'both_sides_changed_since_baseline',
       planHash, desiredHash, remoteHash, desired, observed,
