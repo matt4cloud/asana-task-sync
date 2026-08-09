@@ -235,6 +235,29 @@ test('a task without an explicit section cannot be prepared for push', () => {
   );
 });
 
+test('push plan still rejects a bound top-level task without a local section', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'asana-task-sync-push-missing-section-'));
+  const statePath = join(directory, 'TASK_CONTROL.json');
+  const envPath = join(directory, 'TASK_CONTROL.env');
+  const controlState = attachRuntime(state());
+  const controlledTask = task();
+  const remote = remoteFromTask(controlState, controlledTask);
+  controlledTask.asana.section_gid = null;
+  controlledTask.asana.section_name = null;
+  controlState.tasks = [controlledTask];
+  await writeFile(statePath, `${JSON.stringify(controlState, null, 2)}\n`, 'utf8');
+  const snapshotPath = await writeSnapshot(directory, snapshot([remote]));
+
+  try {
+    await assert.rejects(
+      main(['push', '--plan', '--snapshot', snapshotPath, '--env', envPath], environment('TASK_CONTROL.json')),
+      /requires an explicit asana\.section_gid and asana\.section_name/,
+    );
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test('validate is local and does not require an MCP snapshot', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'asana-task-sync-validate-'));
   const statePath = join(directory, 'TASK_CONTROL.json');
@@ -408,6 +431,580 @@ test('pull plan does not write JSON and pull apply accepts an MCP snapshot', asy
       'pull', '--apply', '--go', 'GO_PULL', '--snapshot', snapshotPath, '--plan-receipt', planReceiptPath, '--env', envPath,
     ], environment('TASK_CONTROL.json'));
     assert.equal(apply.changed_json, false);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('first pull plans and applies the Asana section when the bound task has no local baseline section', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'asana-task-sync-first-pull-section-'));
+  const statePath = join(directory, 'TASK_CONTROL.json');
+  const envPath = join(directory, 'TASK_CONTROL.env');
+  const controlState = attachRuntime(state());
+  const controlledTask = task();
+  const remote = remoteFromTask(controlState, controlledTask, 'Ręczna notatka operatora.');
+  controlledTask.asana.section_gid = null;
+  controlledTask.asana.section_name = null;
+  controlState.tasks = [controlledTask];
+  const before = `${JSON.stringify(controlState, null, 2)}\n`;
+  await writeFile(statePath, before, 'utf8');
+  const snapshotPath = await writeSnapshot(directory, snapshot([remote]));
+  const planReceiptPath = join(directory, 'first-pull-plan-receipt.json');
+
+  try {
+    const plan = await main([
+      'pull', '--plan', '--snapshot', snapshotPath, '--plan-receipt', planReceiptPath, '--env', envPath,
+    ], environment('TASK_CONTROL.json'));
+    assert.equal(plan.changed_json, false);
+    assert.equal(plan.tasks[0].action, 'baseline_required');
+    assert.deepEqual(plan.tasks[0].diff.filter((entry) => entry.field.startsWith('section_')), [
+      { field: 'section_gid', json: null, asana: 'section-todo' },
+      { field: 'section_name', json: null, asana: 'TO DO' },
+    ]);
+    assert.equal(await readFile(statePath, 'utf8'), before);
+
+    const applied = await main([
+      'pull', '--apply', '--go', 'GO_PULL', '--snapshot', snapshotPath,
+      '--plan-receipt', planReceiptPath, '--env', envPath,
+    ], environment('TASK_CONTROL.json'));
+    assert.equal(applied.changed_json, true);
+    const savedTask = JSON.parse(await readFile(statePath, 'utf8')).tasks[0];
+    assert.equal(savedTask.asana.section_gid, 'section-todo');
+    assert.equal(savedTask.asana.section_name, 'TO DO');
+    assert.match(savedTask.asana.last_synced_plan_sha256, /^[a-f0-9]{64}$/);
+    assert.match(savedTask.asana.last_synced_projection_sha256, /^[a-f0-9]{64}$/);
+    assert.equal(savedTask.asana.sync_status, 'synchronized');
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('first pull refuses an Asana section change after planning and preserves the empty local section', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'asana-task-sync-first-pull-section-drift-'));
+  const statePath = join(directory, 'TASK_CONTROL.json');
+  const envPath = join(directory, 'TASK_CONTROL.env');
+  const controlState = attachRuntime(state());
+  const controlledTask = task();
+  const plannedRemote = remoteFromTask(controlState, controlledTask);
+  controlledTask.asana.section_gid = null;
+  controlledTask.asana.section_name = null;
+  controlState.tasks = [controlledTask];
+  const before = `${JSON.stringify(controlState, null, 2)}\n`;
+  await writeFile(statePath, before, 'utf8');
+  const planSnapshotPath = await writeSnapshot(directory, snapshot([plannedRemote]));
+  const planReceiptPath = join(directory, 'first-pull-plan-receipt.json');
+  const changedRemote = {
+    ...plannedRemote,
+    memberships: [{
+      project: { gid: target.project.gid },
+      section: { gid: 'section-done', name: 'DONE' },
+    }],
+  };
+  const currentSnapshotPath = join(directory, 'current-mcp-snapshot.json');
+  await writeFile(currentSnapshotPath, `${JSON.stringify(snapshot([changedRemote]), null, 2)}\n`, 'utf8');
+
+  try {
+    await main([
+      'pull', '--plan', '--task', 'asana-1', '--snapshot', planSnapshotPath,
+      '--plan-receipt', planReceiptPath, '--env', envPath,
+    ], environment('TASK_CONTROL.json'));
+    const blocked = await main([
+      'pull', '--apply', '--go', 'GO_PULL', '--task', 'asana-1', '--snapshot', currentSnapshotPath,
+      '--plan-receipt', planReceiptPath, '--env', envPath,
+    ], environment('TASK_CONTROL.json'));
+    assert.equal(blocked.blocked, true);
+    assert.equal(blocked.reason, 'state_changed_after_plan');
+    assert.deepEqual(blocked.decision_required_diff.filter((entry) => entry.field.startsWith('section_')), [
+      {
+        id: 'task-1', source: 'asana', field: 'section_gid',
+        planned_asana: 'section-todo', current_asana: 'section-done',
+      },
+      {
+        id: 'task-1', source: 'asana', field: 'section_name',
+        planned_asana: 'TO DO', current_asana: 'DONE',
+      },
+    ]);
+    assert.equal(await readFile(statePath, 'utf8'), before);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('first pull refuses a local JSON change after planning and makes no further write', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'asana-task-sync-first-pull-json-drift-'));
+  const statePath = join(directory, 'TASK_CONTROL.json');
+  const envPath = join(directory, 'TASK_CONTROL.env');
+  const controlState = attachRuntime(state());
+  const controlledTask = task();
+  const remote = remoteFromTask(controlState, controlledTask);
+  controlledTask.asana.section_gid = null;
+  controlledTask.asana.section_name = null;
+  controlState.tasks = [controlledTask];
+  await writeFile(statePath, `${JSON.stringify(controlState, null, 2)}\n`, 'utf8');
+  const snapshotPath = await writeSnapshot(directory, snapshot([remote]));
+  const planReceiptPath = join(directory, 'first-pull-plan-receipt.json');
+
+  try {
+    await main([
+      'pull', '--plan', '--snapshot', snapshotPath, '--plan-receipt', planReceiptPath, '--env', envPath,
+    ], environment('TASK_CONTROL.json'));
+    controlledTask.asana.due_on = '2026-08-10';
+    const changedJson = `${JSON.stringify(controlState, null, 2)}\n`;
+    await writeFile(statePath, changedJson, 'utf8');
+
+    const blocked = await main([
+      'pull', '--apply', '--go', 'GO_PULL', '--snapshot', snapshotPath,
+      '--plan-receipt', planReceiptPath, '--env', envPath,
+    ], environment('TASK_CONTROL.json'));
+    assert.equal(blocked.blocked, true);
+    assert.equal(blocked.reason, 'state_changed_after_plan');
+    assert.deepEqual(blocked.decision_required_diff.find((entry) => (
+      entry.source === 'json' && entry.field === 'asana.due_on'
+    )), {
+      id: 'task-1', source: 'json', field: 'asana.due_on',
+      planned_json: null, current_json: '2026-08-10',
+    });
+    assert.equal(await readFile(statePath, 'utf8'), changedJson);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('first pull refuses a changed local Asana GID even when the replacement task has an identical projection', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'asana-task-sync-first-pull-gid-drift-'));
+  const statePath = join(directory, 'TASK_CONTROL.json');
+  const envPath = join(directory, 'TASK_CONTROL.env');
+  const controlState = attachRuntime(state());
+  const controlledTask = task();
+  const plannedRemote = remoteFromTask(controlState, controlledTask);
+  controlledTask.asana.section_gid = null;
+  controlledTask.asana.section_name = null;
+  controlState.tasks = [controlledTask];
+  await writeFile(statePath, `${JSON.stringify(controlState, null, 2)}\n`, 'utf8');
+  const planSnapshotPath = await writeSnapshot(directory, snapshot([plannedRemote]));
+  const planReceiptPath = join(directory, 'first-pull-plan-receipt.json');
+
+  try {
+    await main([
+      'pull', '--plan', '--task', 'asana-1', '--snapshot', planSnapshotPath,
+      '--plan-receipt', planReceiptPath, '--env', envPath,
+    ], environment('TASK_CONTROL.json'));
+    controlledTask.asana.gid = 'asana-2';
+    const changedJson = `${JSON.stringify(controlState, null, 2)}\n`;
+    await writeFile(statePath, changedJson, 'utf8');
+    const replacementRemote = { ...plannedRemote, gid: 'asana-2' };
+    const currentSnapshotPath = join(directory, 'replacement-mcp-snapshot.json');
+    await writeFile(currentSnapshotPath, `${JSON.stringify(snapshot([replacementRemote]), null, 2)}\n`, 'utf8');
+
+    const blocked = await main([
+      'pull', '--apply', '--go', 'GO_PULL', '--task', 'asana-1', '--snapshot', currentSnapshotPath,
+      '--plan-receipt', planReceiptPath, '--env', envPath,
+    ], environment('TASK_CONTROL.json'));
+    assert.equal(blocked.blocked, true);
+    assert.equal(blocked.changed_json, false);
+    assert.deepEqual(blocked.decision_required_diff, [{
+      id: 'task-1', source: 'json', field: 'asana.gid',
+      planned_json: 'asana-1', current_json: 'asana-2',
+    }]);
+    assert.equal(await readFile(statePath, 'utf8'), changedJson);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('first pull reports stable local ID drift with a planned GID selector and without a selector', async () => {
+  const cases = [
+    { name: 'gid-selector', selector: ['--task', 'asana-1'] },
+    { name: 'full-pull', selector: [] },
+  ];
+
+  for (const testCase of cases) {
+    const directory = await mkdtemp(join(tmpdir(), `asana-task-sync-first-pull-id-drift-${testCase.name}-`));
+    const statePath = join(directory, 'TASK_CONTROL.json');
+    const envPath = join(directory, 'TASK_CONTROL.env');
+    const controlState = attachRuntime(state());
+    const controlledTask = task();
+    const remote = remoteFromTask(controlState, controlledTask);
+    controlledTask.asana.section_gid = null;
+    controlledTask.asana.section_name = null;
+    controlState.tasks = [controlledTask];
+    await writeFile(statePath, `${JSON.stringify(controlState, null, 2)}\n`, 'utf8');
+    const snapshotPath = await writeSnapshot(directory, snapshot([remote]));
+    const planReceiptPath = join(directory, 'first-pull-plan-receipt.json');
+
+    try {
+      await main([
+        'pull', '--plan', ...testCase.selector, '--snapshot', snapshotPath,
+        '--plan-receipt', planReceiptPath, '--env', envPath,
+      ], environment('TASK_CONTROL.json'));
+      controlledTask.id = 'task-2';
+      const changedJson = `${JSON.stringify(controlState, null, 2)}\n`;
+      await writeFile(statePath, changedJson, 'utf8');
+
+      const blocked = await main([
+        'pull', '--apply', '--go', 'GO_PULL', ...testCase.selector, '--snapshot', snapshotPath,
+        '--plan-receipt', planReceiptPath, '--env', envPath,
+      ], environment('TASK_CONTROL.json'));
+      assert.equal(blocked.blocked, true);
+      assert.equal(blocked.changed_json, false);
+      assert.deepEqual(blocked.decision_required_diff, [{
+        id: 'task-1', source: 'json', field: 'id',
+        planned_json: 'task-1', current_json: 'task-2',
+      }]);
+      assert.equal(await readFile(statePath, 'utf8'), changedJson);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  }
+});
+
+test('first pull reports JSON task presence drift when neither planned identity resolves', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'asana-task-sync-first-pull-identity-missing-'));
+  const statePath = join(directory, 'TASK_CONTROL.json');
+  const envPath = join(directory, 'TASK_CONTROL.env');
+  const controlState = attachRuntime(state());
+  const controlledTask = task();
+  const remote = remoteFromTask(controlState, controlledTask);
+  controlledTask.asana.section_gid = null;
+  controlledTask.asana.section_name = null;
+  controlState.tasks = [controlledTask];
+  await writeFile(statePath, `${JSON.stringify(controlState, null, 2)}\n`, 'utf8');
+  const snapshotPath = await writeSnapshot(directory, snapshot([remote]));
+  const planReceiptPath = join(directory, 'first-pull-plan-receipt.json');
+
+  try {
+    await main([
+      'pull', '--plan', '--task', 'asana-1', '--snapshot', snapshotPath,
+      '--plan-receipt', planReceiptPath, '--env', envPath,
+    ], environment('TASK_CONTROL.json'));
+    controlledTask.id = 'task-2';
+    controlledTask.asana.gid = 'asana-2';
+    const changedJson = `${JSON.stringify(controlState, null, 2)}\n`;
+    await writeFile(statePath, changedJson, 'utf8');
+
+    const blocked = await main([
+      'pull', '--apply', '--go', 'GO_PULL', '--task', 'asana-1', '--snapshot', snapshotPath,
+      '--plan-receipt', planReceiptPath, '--env', envPath,
+    ], environment('TASK_CONTROL.json'));
+    assert.equal(blocked.blocked, true);
+    assert.equal(blocked.changed_json, false);
+    assert.deepEqual(blocked.decision_required_diff, [{
+      id: 'task-1', source: 'json', field: 'task_presence',
+      planned_json: 'present', current_json: 'missing',
+    }]);
+    assert.equal(await readFile(statePath, 'utf8'), changedJson);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('first pull reports ambiguous JSON task presence when planned GID fallback is not unique', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'asana-task-sync-first-pull-identity-ambiguous-'));
+  const statePath = join(directory, 'TASK_CONTROL.json');
+  const envPath = join(directory, 'TASK_CONTROL.env');
+  const controlState = attachRuntime(state());
+  const controlledTask = task();
+  const remote = remoteFromTask(controlState, controlledTask);
+  controlledTask.asana.section_gid = null;
+  controlledTask.asana.section_name = null;
+  controlState.tasks = [controlledTask];
+  await writeFile(statePath, `${JSON.stringify(controlState, null, 2)}\n`, 'utf8');
+  const snapshotPath = await writeSnapshot(directory, snapshot([remote]));
+  const planReceiptPath = join(directory, 'first-pull-plan-receipt.json');
+
+  try {
+    await main([
+      'pull', '--plan', '--task', 'asana-1', '--snapshot', snapshotPath,
+      '--plan-receipt', planReceiptPath, '--env', envPath,
+    ], environment('TASK_CONTROL.json'));
+    controlledTask.id = 'task-2';
+    controlState.tasks.push(task({
+      id: 'task-3',
+      asana: { ...controlledTask.asana },
+    }));
+    const changedJson = `${JSON.stringify(controlState, null, 2)}\n`;
+    await writeFile(statePath, changedJson, 'utf8');
+
+    const blocked = await main([
+      'pull', '--apply', '--go', 'GO_PULL', '--task', 'asana-1', '--snapshot', snapshotPath,
+      '--plan-receipt', planReceiptPath, '--env', envPath,
+    ], environment('TASK_CONTROL.json'));
+    assert.equal(blocked.blocked, true);
+    assert.equal(blocked.changed_json, false);
+    assert.deepEqual(blocked.decision_required_diff, [{
+      id: 'task-1', source: 'json', field: 'task_presence',
+      planned_json: 'present', current_json: 'ambiguous_asana_gid',
+    }]);
+    assert.equal(await readFile(statePath, 'utf8'), changedJson);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('unscoped first pull reports a bound task added after planning and makes no JSON write', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'asana-task-sync-first-pull-task-added-'));
+  const statePath = join(directory, 'TASK_CONTROL.json');
+  const envPath = join(directory, 'TASK_CONTROL.env');
+  const controlState = attachRuntime(state());
+  const controlledTask = task();
+  const remote = remoteFromTask(controlState, controlledTask);
+  controlledTask.asana.section_gid = null;
+  controlledTask.asana.section_name = null;
+  controlState.tasks = [controlledTask];
+  await writeFile(statePath, `${JSON.stringify(controlState, null, 2)}\n`, 'utf8');
+  const snapshotPath = await writeSnapshot(directory, snapshot([remote]));
+  const planReceiptPath = join(directory, 'first-pull-plan-receipt.json');
+
+  try {
+    await main([
+      'pull', '--plan', '--snapshot', snapshotPath, '--plan-receipt', planReceiptPath, '--env', envPath,
+    ], environment('TASK_CONTROL.json'));
+    controlState.tasks.push(task({
+      id: 'task-2',
+      asana: { ...task().asana, gid: 'asana-2' },
+    }));
+    const changedJson = `${JSON.stringify(controlState, null, 2)}\n`;
+    await writeFile(statePath, changedJson, 'utf8');
+
+    const blocked = await main([
+      'pull', '--apply', '--go', 'GO_PULL', '--snapshot', snapshotPath,
+      '--plan-receipt', planReceiptPath, '--env', envPath,
+    ], environment('TASK_CONTROL.json'));
+    assert.equal(blocked.blocked, true);
+    assert.equal(blocked.changed_json, false);
+    assert.deepEqual(blocked.decision_required_diff, [{
+      id: 'task-2', source: 'json', field: 'task_presence',
+      planned_json: 'missing', current_json: 'present',
+    }]);
+    assert.equal(await readFile(statePath, 'utf8'), changedJson);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('scoped first pull ignores a bound task added outside the selected receipt scope', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'asana-task-sync-first-pull-scoped-task-added-'));
+  const statePath = join(directory, 'TASK_CONTROL.json');
+  const envPath = join(directory, 'TASK_CONTROL.env');
+  const controlState = attachRuntime(state());
+  const controlledTask = task();
+  const remote = remoteFromTask(controlState, controlledTask);
+  controlledTask.asana.section_gid = null;
+  controlledTask.asana.section_name = null;
+  controlState.tasks = [controlledTask];
+  await writeFile(statePath, `${JSON.stringify(controlState, null, 2)}\n`, 'utf8');
+  const snapshotPath = await writeSnapshot(directory, snapshot([remote]));
+  const planReceiptPath = join(directory, 'first-pull-plan-receipt.json');
+
+  try {
+    await main([
+      'pull', '--plan', '--task', 'task-1', '--snapshot', snapshotPath,
+      '--plan-receipt', planReceiptPath, '--env', envPath,
+    ], environment('TASK_CONTROL.json'));
+    const addedTask = task({
+      id: 'task-2',
+      asana: { ...task().asana, gid: 'asana-2' },
+    });
+    controlState.tasks.push(addedTask);
+    await writeFile(statePath, `${JSON.stringify(controlState, null, 2)}\n`, 'utf8');
+
+    const applied = await main([
+      'pull', '--apply', '--go', 'GO_PULL', '--task', 'task-1', '--snapshot', snapshotPath,
+      '--plan-receipt', planReceiptPath, '--env', envPath,
+    ], environment('TASK_CONTROL.json'));
+    assert.equal(applied.blocked, undefined);
+    assert.equal(applied.changed_json, true);
+    const savedTasks = JSON.parse(await readFile(statePath, 'utf8')).tasks;
+    assert.equal(savedTasks[0].asana.section_gid, 'section-todo');
+    assert.deepEqual(savedTasks[1], addedTask);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('unscoped first pull reports a planned task removed after planning', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'asana-task-sync-first-pull-task-removed-'));
+  const statePath = join(directory, 'TASK_CONTROL.json');
+  const envPath = join(directory, 'TASK_CONTROL.env');
+  const controlState = attachRuntime(state());
+  const controlledTask = task();
+  const remote = remoteFromTask(controlState, controlledTask);
+  controlledTask.asana.section_gid = null;
+  controlledTask.asana.section_name = null;
+  controlState.tasks = [controlledTask];
+  await writeFile(statePath, `${JSON.stringify(controlState, null, 2)}\n`, 'utf8');
+  const snapshotPath = await writeSnapshot(directory, snapshot([remote]));
+  const planReceiptPath = join(directory, 'first-pull-plan-receipt.json');
+
+  try {
+    await main([
+      'pull', '--plan', '--snapshot', snapshotPath, '--plan-receipt', planReceiptPath, '--env', envPath,
+    ], environment('TASK_CONTROL.json'));
+    controlState.tasks = [];
+    const changedJson = `${JSON.stringify(controlState, null, 2)}\n`;
+    await writeFile(statePath, changedJson, 'utf8');
+
+    const blocked = await main([
+      'pull', '--apply', '--go', 'GO_PULL', '--snapshot', snapshotPath,
+      '--plan-receipt', planReceiptPath, '--env', envPath,
+    ], environment('TASK_CONTROL.json'));
+    assert.equal(blocked.blocked, true);
+    assert.equal(blocked.changed_json, false);
+    assert.deepEqual(blocked.decision_required_diff, [{
+      id: 'task-1', source: 'json', field: 'task_presence',
+      planned_json: 'present', current_json: 'missing',
+    }]);
+    assert.equal(await readFile(statePath, 'utf8'), changedJson);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('first pull refuses one-hash and both-hashes baseline drift without overwriting either JSON state', async () => {
+  const cases = [
+    {
+      name: 'one-hash',
+      changes: { last_synced_plan_sha256: 'a'.repeat(64) },
+      expected: [{
+        field: 'asana.last_synced_plan_sha256', planned_json: null, current_json: 'a'.repeat(64),
+      }],
+    },
+    {
+      name: 'both-hashes',
+      changes: {
+        last_synced_plan_sha256: 'a'.repeat(64),
+        last_synced_projection_sha256: 'b'.repeat(64),
+      },
+      expected: [
+        { field: 'asana.last_synced_plan_sha256', planned_json: null, current_json: 'a'.repeat(64) },
+        { field: 'asana.last_synced_projection_sha256', planned_json: null, current_json: 'b'.repeat(64) },
+      ],
+    },
+  ];
+
+  for (const testCase of cases) {
+    const directory = await mkdtemp(join(tmpdir(), `asana-task-sync-first-pull-${testCase.name}-drift-`));
+    const statePath = join(directory, 'TASK_CONTROL.json');
+    const envPath = join(directory, 'TASK_CONTROL.env');
+    const controlState = attachRuntime(state());
+    const controlledTask = task();
+    const remote = remoteFromTask(controlState, controlledTask);
+    controlledTask.asana.section_gid = null;
+    controlledTask.asana.section_name = null;
+    controlState.tasks = [controlledTask];
+    await writeFile(statePath, `${JSON.stringify(controlState, null, 2)}\n`, 'utf8');
+    const snapshotPath = await writeSnapshot(directory, snapshot([remote]));
+    const planReceiptPath = join(directory, 'first-pull-plan-receipt.json');
+
+    try {
+      await main([
+        'pull', '--plan', '--snapshot', snapshotPath, '--plan-receipt', planReceiptPath, '--env', envPath,
+      ], environment('TASK_CONTROL.json'));
+      Object.assign(controlledTask.asana, testCase.changes);
+      const changedJson = `${JSON.stringify(controlState, null, 2)}\n`;
+      await writeFile(statePath, changedJson, 'utf8');
+
+      const blocked = await main([
+        'pull', '--apply', '--go', 'GO_PULL', '--snapshot', snapshotPath,
+        '--plan-receipt', planReceiptPath, '--env', envPath,
+      ], environment('TASK_CONTROL.json'));
+      assert.equal(blocked.blocked, true);
+      assert.equal(blocked.changed_json, false);
+      assert.deepEqual(blocked.decision_required_diff, testCase.expected.map((entry) => ({
+        id: 'task-1', source: 'json', ...entry,
+      })));
+      assert.equal(await readFile(statePath, 'utf8'), changedJson);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  }
+});
+
+test('pull apply rejects a receipt created without the canonical JSON task guard', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'asana-task-sync-pull-receipt-without-json-guard-'));
+  const statePath = join(directory, 'TASK_CONTROL.json');
+  const envPath = join(directory, 'TASK_CONTROL.env');
+  const controlState = attachRuntime(state());
+  const controlledTask = task();
+  const remote = remoteFromTask(controlState, controlledTask);
+  controlledTask.asana.section_gid = null;
+  controlledTask.asana.section_name = null;
+  controlState.tasks = [controlledTask];
+  const before = `${JSON.stringify(controlState, null, 2)}\n`;
+  await writeFile(statePath, before, 'utf8');
+  const snapshotPath = await writeSnapshot(directory, snapshot([remote]));
+  const planReceiptPath = join(directory, 'first-pull-plan-receipt.json');
+
+  try {
+    await main([
+      'pull', '--plan', '--snapshot', snapshotPath, '--plan-receipt', planReceiptPath, '--env', envPath,
+    ], environment('TASK_CONTROL.json'));
+    const receipt = JSON.parse(await readFile(planReceiptPath, 'utf8'));
+    delete receipt.tasks[0].planned_json_task;
+    await writeFile(planReceiptPath, `${JSON.stringify(receipt, null, 2)}\n`, 'utf8');
+
+    await assert.rejects(
+      main([
+        'pull', '--apply', '--go', 'GO_PULL', '--snapshot', snapshotPath,
+        '--plan-receipt', planReceiptPath, '--env', envPath,
+      ], environment('TASK_CONTROL.json')),
+      /Pull plan receipt lacks its JSON task guard\. Run a new --plan\./,
+    );
+    assert.equal(await readFile(statePath, 'utf8'), before);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('pull rejects a missing local section once a top-level task already has a baseline', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'asana-task-sync-pull-baseline-missing-section-'));
+  const statePath = join(directory, 'TASK_CONTROL.json');
+  const envPath = join(directory, 'TASK_CONTROL.env');
+  const controlState = attachRuntime(state());
+  const controlledTask = task();
+  const remote = remoteFromTask(controlState, controlledTask);
+  establishBaseline(controlState, controlledTask, remote);
+  controlledTask.asana.section_gid = null;
+  controlledTask.asana.section_name = null;
+  controlState.tasks = [controlledTask];
+  await writeFile(statePath, `${JSON.stringify(controlState, null, 2)}\n`, 'utf8');
+  const snapshotPath = await writeSnapshot(directory, snapshot([remote]));
+
+  try {
+    await assert.rejects(
+      main(['pull', '--plan', '--snapshot', snapshotPath, '--env', envPath], environment('TASK_CONTROL.json')),
+      /requires an explicit asana\.section_gid and asana\.section_name/,
+    );
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('pull rejects a top-level snapshot task without a section', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'asana-task-sync-pull-snapshot-missing-section-'));
+  const statePath = join(directory, 'TASK_CONTROL.json');
+  const envPath = join(directory, 'TASK_CONTROL.env');
+  const controlledTask = task({
+    asana: { ...task().asana, section_gid: null, section_name: null },
+  });
+  await writeFile(statePath, `${JSON.stringify(state([controlledTask]), null, 2)}\n`, 'utf8');
+  const invalidSnapshot = snapshot([]);
+  invalidSnapshot.tasks = [{
+    gid: controlledTask.asana.gid,
+    name: `[demo] ${controlledTask.title}`,
+    notes: renderNotes(attachRuntime(state()), controlledTask, ''),
+    completed: false,
+    due_on: null,
+    modified_at: '2026-08-04T10:00:00.000Z',
+    assignee: { ...target.assignee },
+  }];
+  const snapshotPath = await writeSnapshot(directory, invalidSnapshot);
+
+  try {
+    await assert.rejects(
+      main(['pull', '--plan', '--snapshot', snapshotPath, '--env', envPath], environment('TASK_CONTROL.json')),
+      /tasks\[0\]\.section\.gid must be a non-empty string/,
+    );
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

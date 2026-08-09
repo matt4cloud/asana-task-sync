@@ -93,13 +93,20 @@ function taskSection(remote, projectGid) {
   };
 }
 
-export function desiredProjection(state, task) {
+export function desiredProjection(state, task, { allowInitialPullWithoutSection = false } = {}) {
   const tracksParent = Object.hasOwn(task.asana, 'parent_gid');
   const parentGid = tracksParent ? (task.asana.parent_gid ?? null) : null;
   const isSubtask = Boolean(parentGid);
   const sectionGid = task.asana.section_gid;
   const sectionName = task.asana.section_name;
-  if (!isSubtask && (!sectionGid || !sectionName)) {
+  const missingBaseline = !task.asana.last_synced_plan_sha256
+    || !task.asana.last_synced_projection_sha256;
+  const canPullInitialSection = allowInitialPullWithoutSection
+    && Boolean(task.asana.gid)
+    && missingBaseline
+    && sectionGid === null
+    && sectionName === null;
+  if (!isSubtask && (!sectionGid || !sectionName) && !canPullInitialSection) {
     throw new Error(`Task ${task.id} requires an explicit asana.section_gid and asana.section_name before push.`);
   }
   const projection = {
@@ -210,8 +217,25 @@ function projectionDiff(expected, actual, expectedLabel, actualLabel) {
   ));
 }
 
-export function classifyKnownTask(state, task, remote) {
-  const desired = desiredProjection(state, task);
+function jsonTaskDiff(expected, actual, path = '') {
+  if (stableJson(expected) === stableJson(actual)) return [];
+  const expectedIsObject = expected !== null && typeof expected === 'object' && !Array.isArray(expected);
+  const actualIsObject = actual !== null && typeof actual === 'object' && !Array.isArray(actual);
+  if (expectedIsObject && actualIsObject) {
+    const keys = new Set([...Object.keys(expected), ...Object.keys(actual)]);
+    return [...keys].sort().flatMap((key) => (
+      jsonTaskDiff(expected[key], actual[key], path ? `${path}.${key}` : key)
+    ));
+  }
+  return [{
+    field: path,
+    planned_json: expected ?? null,
+    current_json: actual ?? null,
+  }];
+}
+
+export function classifyKnownTask(state, task, remote, projectionOptions = {}) {
+  const desired = desiredProjection(state, task, projectionOptions);
   const observed = remoteProjection(state, task, remote);
   const planHash = sha256(planPayload(state, task));
   const desiredHash = projectionHash(desired);
@@ -615,6 +639,18 @@ function selectTasks(state, taskSelector) {
   return selected;
 }
 
+function resolvePlannedPullTask(state, planned) {
+  const idMatches = state.tasks.filter((task) => task.id === planned.id);
+  if (idMatches.length === 1) return { task: idMatches[0], issue: null, candidates: idMatches };
+  if (idMatches.length > 1) return { task: null, issue: 'ambiguous_local_id', candidates: idMatches };
+  const gidMatches = planned.asana_gid
+    ? state.tasks.filter((task) => task.asana.gid === planned.asana_gid)
+    : [];
+  if (gidMatches.length === 1) return { task: gidMatches[0], issue: null, candidates: gidMatches };
+  if (gidMatches.length > 1) return { task: null, issue: 'ambiguous_asana_gid', candidates: gidMatches };
+  return { task: null, issue: 'missing', candidates: [] };
+}
+
 function receiptTask(state, task, result) {
   const tracksAssignee = Object.hasOwn(task.asana, 'assignee_gid');
   const tracksParent = Object.hasOwn(task.asana, 'parent_gid');
@@ -622,6 +658,7 @@ function receiptTask(state, task, result) {
     id: task.id,
     asana_gid: task.asana.gid,
     action: result.kind,
+    planned_json_task: JSON.parse(JSON.stringify(task)),
     plan_payload: planPayload(state, task),
     desired: comparableDesiredProjection(result.desired),
     observed: comparableObservedProjection(result.observed, tracksAssignee, tracksParent),
@@ -643,7 +680,7 @@ async function pull(state, snapshot, apply, tasks) {
       report.push({ id: task.id, asana_gid: task.asana.gid, action: 'snapshot_missing', reason: 'tracked_task_not_in_mcp_snapshot' });
       continue;
     }
-    const result = classifyKnownTask(state, task, remote);
+    const result = classifyKnownTask(state, task, remote, { allowInitialPullWithoutSection: true });
     report.push(reportEntry(task, result));
     receiptTasks.push(receiptTask(state, task, result));
     if (!apply) continue;
@@ -829,8 +866,8 @@ async function writePlanReceipt(receiptPath, statePath, options, receiptTasks) {
   return receipt;
 }
 
-async function readPlanReceipt(receiptPath, statePath, options, tasks) {
-  const receipt = JSON.parse(await readFile(receiptPath, 'utf8'));
+async function readPlanReceipt(receiptPath, statePath, options, tasks, loadedReceipt = null) {
+  const receipt = loadedReceipt ?? JSON.parse(await readFile(receiptPath, 'utf8'));
   if (receipt?.schema_version !== 'asana-task-sync-plan-receipt/v1'
     || receipt.operation !== options.operation
     || receipt.state_path !== statePath
@@ -839,7 +876,32 @@ async function readPlanReceipt(receiptPath, statePath, options, tasks) {
     || !Array.isArray(receipt.tasks)) {
     throw new Error('Plan receipt does not match this operation, state file, or selected task scope. Run a new --plan.');
   }
-  const eligibleTasks = options.operation === 'pull' ? tasks.filter((task) => task.asana.gid) : tasks;
+  if (options.operation === 'pull'
+    && receipt.tasks.some((task) => !Object.hasOwn(task, 'planned_json_task'))) {
+    throw new Error('Pull plan receipt lacks its JSON task guard. Run a new --plan.');
+  }
+  if (options.operation === 'pull') {
+    if (new Set(receipt.tasks.map((task) => task.id)).size !== receipt.tasks.length) {
+      throw new Error('Pull plan receipt contains duplicate planned task IDs. Run a new --plan.');
+    }
+    if (options.taskSelector) {
+      const selectors = options.taskSelector.split(',').map((value) => value.trim()).filter(Boolean);
+      const selectedIds = new Set();
+      for (const selector of selectors) {
+        const matches = receipt.tasks.filter((task) => task.id === selector || task.asana_gid === selector);
+        if (matches.length !== 1) {
+          throw new Error('Plan receipt task scope does not match the selected pull task. Run a new --plan.');
+        }
+        selectedIds.add(matches[0].id);
+      }
+      if (selectedIds.size !== receipt.tasks.length) {
+        throw new Error('Plan receipt task scope does not match the selected pull task. Run a new --plan.');
+      }
+    }
+    return receipt;
+  }
+  const receiptIds = new Set(receipt.tasks.map((task) => task.id));
+  const eligibleTasks = tasks;
   const expectedIds = new Set(eligibleTasks.map((task) => task.id));
   if (receipt.tasks.length !== expectedIds.size
     || receipt.tasks.some((task) => !expectedIds.has(task.id))) {
@@ -852,8 +914,68 @@ function planReceiptDiff(state, snapshot, options, tasks, receipt) {
   const receiptById = new Map(receipt.tasks.map((task) => [task.id, task]));
   const remoteByGid = new Map(snapshot.remotes.map((remote) => [remote.gid, remote]));
   const diff = [];
+  if (options.operation === 'pull') {
+    const accountedTasks = new Set();
+    for (const planned of receipt.tasks) {
+      const resolved = resolvePlannedPullTask(state, planned);
+      for (const candidate of resolved.candidates) accountedTasks.add(candidate);
+      if (!resolved.task) {
+        diff.push({
+          id: planned.id,
+          source: 'json',
+          field: 'task_presence',
+          planned_json: 'present',
+          current_json: resolved.issue,
+        });
+        continue;
+      }
+      const task = resolved.task;
+      const taskDiff = jsonTaskDiff(planned.planned_json_task, task)
+        .map((entry) => ({ id: planned.id, source: 'json', ...entry }));
+      diff.push(...taskDiff);
+      if (taskDiff.length > 0) continue;
+      const currentPlan = planPayload(state, task);
+      diff.push(...projectionDiff(planned.plan_payload, currentPlan, 'planned_json', 'current_json')
+        .map((entry) => ({ id: planned.id, source: 'json', ...entry })));
+      const currentDesired = comparableDesiredProjection(desiredProjection(state, task, {
+        allowInitialPullWithoutSection: true,
+      }));
+      diff.push(...projectionDiff(planned.desired, currentDesired, 'planned_json_projection', 'current_json_projection')
+        .map((entry) => ({ id: planned.id, source: 'json', ...entry })));
+      const remote = planned.asana_gid ? remoteByGid.get(planned.asana_gid) : null;
+      if (!remote) {
+        diff.push({
+          id: planned.id,
+          source: 'asana',
+          field: 'task_presence',
+          planned_asana: 'present',
+          current_asana: 'missing',
+        });
+        continue;
+      }
+      const currentObserved = comparableObservedProjection(
+        remoteProjection(state, task, remote),
+        Object.hasOwn(task.asana, 'assignee_gid'),
+        Object.hasOwn(task.asana, 'parent_gid'),
+      );
+      diff.push(...projectionDiff(planned.observed, currentObserved, 'planned_asana', 'current_asana')
+        .map((entry) => ({ id: planned.id, source: 'asana', ...entry })));
+    }
+    if (!options.taskSelector) {
+      for (const task of state.tasks) {
+        if (!task.asana.gid || accountedTasks.has(task)) continue;
+        diff.push({
+          id: task.id,
+          source: 'json',
+          field: 'task_presence',
+          planned_json: 'missing',
+          current_json: 'present',
+        });
+      }
+    }
+    return diff;
+  }
   for (const task of tasks) {
-    if (options.operation === 'pull' && !task.asana.gid) continue;
     const planned = receiptById.get(task.id);
     const currentPlan = planPayload(state, task);
     diff.push(...projectionDiff(planned.plan_payload, currentPlan, 'planned_json', 'current_json')
@@ -861,19 +983,6 @@ function planReceiptDiff(state, snapshot, options, tasks, receipt) {
     const currentDesired = comparableDesiredProjection(desiredProjection(state, task));
     diff.push(...projectionDiff(planned.desired, currentDesired, 'planned_json_projection', 'current_json_projection')
       .map((entry) => ({ id: task.id, source: 'json', ...entry })));
-    if (options.operation !== 'pull') continue;
-    const remote = task.asana.gid ? remoteByGid.get(task.asana.gid) : null;
-    if (!remote) {
-      diff.push({ id: task.id, source: 'asana', field: 'task_presence', planned_asana: 'present', current_asana: 'missing' });
-      continue;
-    }
-    const currentObserved = comparableObservedProjection(
-      remoteProjection(state, task, remote),
-      Object.hasOwn(task.asana, 'assignee_gid'),
-      Object.hasOwn(task.asana, 'parent_gid'),
-    );
-    diff.push(...projectionDiff(planned.observed, currentObserved, 'planned_asana', 'current_asana')
-      .map((entry) => ({ id: task.id, source: 'asana', ...entry })));
   }
   return diff;
 }
@@ -1109,9 +1218,20 @@ export async function main(argv = process.argv.slice(2), baseEnvironment = proce
   }
   configureState(state, environment);
   const snapshot = await readMcpSnapshot(options.snapshotPath, state);
-  const tasks = options.operation === 'import' ? null : selectTasks(state, options.taskSelector);
+  let receipt = null;
   if (options.apply && ['pull', 'push'].includes(options.operation)) {
-    const receipt = await readPlanReceipt(options.planReceiptPath, statePath, options, tasks);
+    receipt = JSON.parse(await readFile(options.planReceiptPath, 'utf8'));
+  }
+  const tasks = options.operation === 'import'
+    ? null
+    : options.operation === 'pull' && options.apply && Array.isArray(receipt?.tasks)
+      ? receipt.tasks.flatMap((planned) => {
+        const resolved = resolvePlannedPullTask(state, planned);
+        return resolved.task ? [resolved.task] : [];
+      })
+      : selectTasks(state, options.taskSelector);
+  if (options.apply && ['pull', 'push'].includes(options.operation)) {
+    receipt = await readPlanReceipt(options.planReceiptPath, statePath, options, tasks, receipt);
     const decisionRequiredDiff = planReceiptDiff(state, snapshot, options, tasks, receipt);
     if (decisionRequiredDiff.length > 0) {
       const report = {
