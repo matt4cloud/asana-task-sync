@@ -1,6 +1,6 @@
 {
   "name": "asana-task-sync",
-  "version": "1.2.3",
+  "version": "1.2.4",
   "private": true,
   "description": "Agent-operated JSON task-control synchronizer for Asana.",
   "type": "module",

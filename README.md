@@ -56,6 +56,9 @@ neutral example in [examples/asana-mcp-snapshot.example.json](examples/asana-mcp
 Snapshots are host runtime artifacts, not secrets, but may contain task content;
 keep them outside a repository or ignore them locally.
 
+A subtask's `parent.gid` is its stable relationship key. `parent.name` is
+optional informational context and is never used to identify the parent.
+
 ```text
 Agent configured with Asana MCP
         │

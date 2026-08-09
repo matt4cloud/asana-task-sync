@@ -84,6 +84,15 @@
       },
       "additionalProperties": false
     },
+    "parent": {
+      "type": "object",
+      "required": ["gid"],
+      "properties": {
+        "gid": { "type": "string", "minLength": 1 },
+        "name": { "type": ["string", "null"] }
+      },
+      "additionalProperties": false
+    },
     "task": {
       "type": "object",
       "required": ["gid", "name", "notes", "completed", "due_on", "modified_at"],
@@ -103,7 +112,7 @@
         "section": { "$ref": "#/$defs/section" },
         "parent": {
           "oneOf": [
-            { "$ref": "#/$defs/section" },
+            { "$ref": "#/$defs/parent" },
             { "type": "null" }
           ]
         }

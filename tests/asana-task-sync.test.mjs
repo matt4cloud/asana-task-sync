@@ -1337,6 +1337,146 @@ test('a new subtask is created under its parent instead of a project section', a
   }
 });
 
+test('pull accepts a parent GID without a name and preserves named-snapshot compatibility', async () => {
+  const results = [];
+  for (const parentName of [undefined, 'Parent task', null, '']) {
+    const directory = await mkdtemp(join(tmpdir(), 'asana-task-sync-pull-parent-name-'));
+    const statePath = join(directory, 'TASK_CONTROL.json');
+    const envPath = join(directory, 'TASK_CONTROL.env');
+    const controlState = attachRuntime(state());
+    const subtask = task({
+      id: 'subtask-1',
+      title: 'Subtask of the plan',
+      asana: {
+        ...task().asana,
+        section_gid: null,
+        section_name: null,
+        parent_gid: 'parent-asana-1',
+      },
+    });
+    const remote = {
+      gid: subtask.asana.gid,
+      name: `[demo] ${subtask.title}`,
+      notes: renderNotes(controlState, subtask, ''),
+      completed: false,
+      due_on: null,
+      modified_at: '2026-08-04T10:00:00.000Z',
+      parent: {
+        gid: 'parent-asana-1',
+        ...(parentName !== undefined ? { name: parentName } : {}),
+      },
+    };
+    controlState.tasks = [subtask];
+    await writeFile(statePath, `${JSON.stringify(controlState, null, 2)}\n`, 'utf8');
+    const snapshotPath = await writeSnapshot(directory, snapshotWithParent([remote]));
+    const planReceiptPath = join(directory, 'pull-subtask-plan-receipt.json');
+
+    try {
+      const plan = await main([
+        'pull', '--plan', '--snapshot', snapshotPath,
+        '--plan-receipt', planReceiptPath, '--env', envPath,
+      ], environment('TASK_CONTROL.json'));
+      const applied = await main([
+        'pull', '--apply', '--go', 'GO_PULL', '--snapshot', snapshotPath,
+        '--plan-receipt', planReceiptPath, '--env', envPath,
+      ], environment('TASK_CONTROL.json'));
+      const saved = JSON.parse(await readFile(statePath, 'utf8'));
+      assert.equal(plan.tasks[0].action, 'baseline_required');
+      assert.equal(applied.changed_json, true);
+      assert.equal(saved.tasks[0].asana.parent_gid, 'parent-asana-1');
+      results.push({ plan: plan.tasks, applied: applied.tasks, saved: saved.tasks[0].asana.parent_gid });
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  }
+
+  for (const result of results.slice(1)) assert.deepEqual(result, results[0]);
+});
+
+test('a snapshot parent still requires a non-empty GID', async () => {
+  for (const [label, parent] of [['missing', {}], ['empty', { gid: '' }]]) {
+    const directory = await mkdtemp(join(tmpdir(), `asana-task-sync-parent-${label}-gid-`));
+    const statePath = join(directory, 'TASK_CONTROL.json');
+    const envPath = join(directory, 'TASK_CONTROL.env');
+    const controlState = attachRuntime(state());
+    const subtask = task({
+      asana: {
+        ...task().asana,
+        section_gid: null,
+        section_name: null,
+        parent_gid: 'parent-asana-1',
+      },
+    });
+    const remote = {
+      gid: subtask.asana.gid,
+      name: `[demo] ${subtask.title}`,
+      notes: renderNotes(controlState, subtask, ''),
+      completed: false,
+      due_on: null,
+      modified_at: '2026-08-04T10:00:00.000Z',
+      parent,
+    };
+    controlState.tasks = [subtask];
+    await writeFile(statePath, `${JSON.stringify(controlState, null, 2)}\n`, 'utf8');
+    const snapshotPath = await writeSnapshot(directory, snapshotWithParent([remote]));
+
+    try {
+      await assert.rejects(
+        main(['pull', '--plan', '--snapshot', snapshotPath, '--env', envPath], environment('TASK_CONTROL.json')),
+        /tasks\[0\]\.parent\.gid must be a non-empty string/,
+      );
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  }
+});
+
+test('an optional snapshot parent name must be text or null when supplied', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'asana-task-sync-parent-invalid-name-'));
+  const statePath = join(directory, 'TASK_CONTROL.json');
+  const envPath = join(directory, 'TASK_CONTROL.env');
+  const controlState = attachRuntime(state());
+  const subtask = task({
+    asana: {
+      ...task().asana,
+      section_gid: null,
+      section_name: null,
+      parent_gid: 'parent-asana-1',
+    },
+  });
+  const remote = {
+    gid: subtask.asana.gid,
+    name: `[demo] ${subtask.title}`,
+    notes: renderNotes(controlState, subtask, ''),
+    completed: false,
+    due_on: null,
+    modified_at: '2026-08-04T10:00:00.000Z',
+    parent: { gid: 'parent-asana-1', name: 42 },
+  };
+  controlState.tasks = [subtask];
+  await writeFile(statePath, `${JSON.stringify(controlState, null, 2)}\n`, 'utf8');
+  const snapshotPath = await writeSnapshot(directory, snapshotWithParent([remote]));
+
+  try {
+    await assert.rejects(
+      main(['pull', '--plan', '--snapshot', snapshotPath, '--env', envPath], environment('TASK_CONTROL.json')),
+      /tasks\[0\]\.parent\.name must be a string or null/,
+    );
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('the machine snapshot contract requires only the parent GID', async () => {
+  const schemaPath = fileURLToPath(new URL('../asana-mcp-snapshot.schema.json', import.meta.url));
+  const schema = JSON.parse(await readFile(schemaPath, 'utf8'));
+
+  assert.deepEqual(schema.$defs.parent.required, ['gid']);
+  assert.equal(schema.$defs.task.properties.parent.oneOf[0].$ref, '#/$defs/parent');
+  assert.equal(schema.$defs.parent.properties.gid.minLength, 1);
+  assert.equal(schema.$defs.parent.properties.name.minLength, undefined);
+});
+
 test('push plan and apply reconcile an existing subtask through its parent, not a section', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'asana-task-sync-push-subtask-'));
   const statePath = join(directory, 'TASK_CONTROL.json');

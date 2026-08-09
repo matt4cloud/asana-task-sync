@@ -30,7 +30,7 @@
       "due_on": null,
       "modified_at": "2026-08-04T11:58:00.000Z",
       "assignee": { "gid": "user-456", "email": null },
-      "parent": { "gid": "task-789", "name": "Example Asana task" }
+      "parent": { "gid": "task-789" }
     }
   ],
   "bindings": []

@@ -341,7 +341,10 @@ function snapshotRemoteTask(task, projectGid) {
     memberships: task.section
       ? [{ project: { gid: projectGid }, section: { gid: task.section.gid, name: task.section.name } }]
       : [],
-    parent: task.parent ? { gid: task.parent.gid, name: task.parent.name } : null,
+    parent: task.parent ? {
+      gid: task.parent.gid,
+      ...(Object.hasOwn(task.parent, 'name') ? { name: task.parent.name } : {}),
+    } : null,
   };
 }
 
@@ -384,7 +387,10 @@ function validateMcpSnapshot(snapshot, state) {
     const hasParent = task?.parent !== null && task?.parent !== undefined;
     if (hasParent) {
       requireSnapshotText(task.parent.gid, `tasks[${index}].parent.gid`);
-      requireSnapshotText(task.parent.name, `tasks[${index}].parent.name`);
+      if (task.parent.name !== null && task.parent.name !== undefined
+        && typeof task.parent.name !== 'string') {
+        throw new Error(`Invalid MCP snapshot: tasks[${index}].parent.name must be a string or null.`);
+      }
     } else {
       requireSnapshotText(task?.section?.gid, `tasks[${index}].section.gid`);
       requireSnapshotText(task?.section?.name, `tasks[${index}].section.name`);
