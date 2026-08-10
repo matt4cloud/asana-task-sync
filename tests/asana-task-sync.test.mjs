@@ -1598,7 +1598,7 @@ test('full pull and push plans report an exact unbound remote without creating a
   }
 });
 
-test('managed-only remote notes without an operator heading support pull, push, and bind', async () => {
+test('managed-only bind baseline supports later operator and operational pull without a false conflict', async () => {
   const fixture = await unboundFixture('asana-task-sync-managed-only-notes-');
   try {
     fixture.remote.notes = `${renderManagedNotes(fixture.controlState, fixture.controlledTask)}\n`;
@@ -1632,9 +1632,109 @@ test('managed-only remote notes without an operator heading support pull, push, 
     assert.equal(bindApply.tasks[0].action, 'bound');
 
     const pullAfterBind = await main([
-      'pull', '--plan', '--snapshot', fixture.snapshotPath, '--env', fixture.envPath,
+      'pull', '--plan', '--snapshot', fixture.snapshotPath,
+      '--plan-receipt', join(fixture.directory, 'first-pull-receipt.json'),
+      '--env', fixture.envPath,
     ], environment('TASK_CONTROL.json'));
     assert.equal(pullAfterBind.tasks[0].action, 'baseline_required');
+
+    const managedOnlySnapshotBeforePull = await readFile(fixture.snapshotPath, 'utf8');
+    const firstPull = await main([
+      'pull', '--apply', '--go', 'GO_FIRST_PULL', '--snapshot', fixture.snapshotPath,
+      '--plan-receipt', join(fixture.directory, 'first-pull-receipt.json'),
+      '--env', fixture.envPath,
+    ], environment('TASK_CONTROL.json'));
+    assert.equal(firstPull.changed_json, true);
+    assert.equal(Object.hasOwn(firstPull, 'mcp_operations'), false);
+    assert.equal(await readFile(fixture.snapshotPath, 'utf8'), managedOnlySnapshotBeforePull);
+
+    let savedState = attachRuntime(JSON.parse(await readFile(fixture.statePath, 'utf8')));
+    let savedTask = savedState.tasks[0];
+    assert.equal(savedTask.asana.operator_notes, '');
+    assert.equal(
+      savedTask.asana.last_synced_projection_sha256,
+      sha256(desiredProjection(savedState, savedTask)),
+    );
+
+    fixture.remote.notes = renderNotes(
+      fixture.controlState, fixture.controlledTask, 'Remote operator note.',
+    );
+    fixture.remote.completed = true;
+    fixture.remote.due_on = '2026-08-10';
+    fixture.remote.modified_at = '2026-08-10T12:00:00.000Z';
+    fixture.remote.memberships[0].section = { gid: 'section-done', name: 'DONE' };
+    await writeFile(
+      fixture.snapshotPath, `${JSON.stringify(projectSnapshot([fixture.remote]), null, 2)}\n`, 'utf8',
+    );
+    const laterPullReceiptPath = join(fixture.directory, 'later-pull-receipt.json');
+    const laterPullPlan = await main([
+      'pull', '--plan', '--snapshot', fixture.snapshotPath,
+      '--plan-receipt', laterPullReceiptPath, '--env', fixture.envPath,
+    ], environment('TASK_CONTROL.json'));
+    assert.equal(laterPullPlan.tasks[0].action, 'pull_required');
+    assert.equal(laterPullPlan.tasks[0].reason, 'asana_operational_state_changed');
+    assert.equal(Object.hasOwn(laterPullPlan, 'mcp_operations'), false);
+
+    const laterPullApply = await main([
+      'pull', '--apply', '--go', 'GO_LATER_PULL', '--snapshot', fixture.snapshotPath,
+      '--plan-receipt', laterPullReceiptPath, '--env', fixture.envPath,
+    ], environment('TASK_CONTROL.json'));
+    assert.equal(laterPullApply.changed_json, true);
+    assert.equal(Object.hasOwn(laterPullApply, 'mcp_operations'), false);
+    savedState = attachRuntime(JSON.parse(await readFile(fixture.statePath, 'utf8')));
+    savedTask = savedState.tasks[0];
+    assert.equal(savedTask.asana.section_gid, 'section-done');
+    assert.equal(savedTask.asana.section_name, 'DONE');
+    assert.equal(savedTask.asana.completed, true);
+    assert.equal(savedTask.asana.due_on, '2026-08-10');
+    assert.equal(savedTask.asana.operator_notes, 'Remote operator note.');
+    assert.equal(
+      savedTask.asana.last_synced_projection_sha256,
+      sha256(desiredProjection(savedState, savedTask)),
+    );
+
+    const synchronized = await main([
+      'pull', '--plan', '--snapshot', fixture.snapshotPath, '--env', fixture.envPath,
+    ], environment('TASK_CONTROL.json'));
+    assert.equal(synchronized.tasks[0].action, 'synchronized');
+
+    const canonicalRemote = JSON.parse(JSON.stringify(fixture.remote));
+    const conflictScenarios = [
+      {
+        name: 'title',
+        mutate(remote) { remote.name = '[demo] Changed remote title'; },
+      },
+      {
+        name: 'plan-id',
+        mutate(remote) { remote.notes = remote.notes.replace('Plan ID: task-1', 'Plan ID: other'); },
+      },
+      {
+        name: 'managed-notes',
+        mutate(remote) { remote.notes = remote.notes.replace('Reconcile both states.', 'Changed remotely.'); },
+      },
+      {
+        name: 'unmarked-suffix',
+        mutate(remote) {
+          remote.notes = `${renderManagedNotes(savedState, savedTask)}\n\nUnmarked remote text.`;
+        },
+      },
+    ];
+    const savedBeforeConflicts = await readFile(fixture.statePath, 'utf8');
+    for (const scenario of conflictScenarios) {
+      const conflictingRemote = JSON.parse(JSON.stringify(canonicalRemote));
+      scenario.mutate(conflictingRemote);
+      await writeFile(
+        fixture.snapshotPath,
+        `${JSON.stringify(projectSnapshot([conflictingRemote]), null, 2)}\n`,
+        'utf8',
+      );
+      const conflict = await main([
+        'pull', '--plan', '--snapshot', fixture.snapshotPath, '--env', fixture.envPath,
+      ], environment('TASK_CONTROL.json'));
+      assert.equal(conflict.tasks[0].action, 'conflict', scenario.name);
+      assert.equal(Object.hasOwn(conflict, 'mcp_operations'), false, scenario.name);
+      assert.equal(await readFile(fixture.statePath, 'utf8'), savedBeforeConflicts, scenario.name);
+    }
   } finally {
     await rm(fixture.directory, { recursive: true, force: true });
   }

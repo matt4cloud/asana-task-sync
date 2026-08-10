@@ -301,6 +301,17 @@ function observedHash(observed, tracksAssignee = false, tracksParent = false) {
   return sha256(value);
 }
 
+function synchronizationObservedHash(
+  state, task, observed, tracksAssignee = false, tracksParent = false,
+) {
+  const managedOnlyNotes = !observed.has_operator_heading
+    && observed.notes.trim() === renderManagedNotes(state, task);
+  const projection = managedOnlyNotes
+    ? { ...observed, notes: renderNotes(state, task, '') }
+    : observed;
+  return observedHash(projection, tracksAssignee, tracksParent);
+}
+
 function comparableDesiredProjection(desired) {
   return {
     name: desired.name,
@@ -360,8 +371,9 @@ export function classifyKnownTask(state, task, remote, projectionOptions = {}) {
   const observed = remoteProjection(state, task, remote);
   const planHash = sha256(planPayload(state, task));
   const desiredHash = projectionHash(desired);
-  const remoteHash = observedHash(
-    observed, Object.hasOwn(task.asana, 'assignee_gid'), Object.hasOwn(task.asana, 'parent_gid'),
+  const remoteHash = synchronizationObservedHash(
+    state, task, observed,
+    Object.hasOwn(task.asana, 'assignee_gid'), Object.hasOwn(task.asana, 'parent_gid'),
   );
   const baselinePlan = task.asana.last_synced_plan_sha256;
   const baselineProjection = task.asana.last_synced_projection_sha256;
@@ -415,8 +427,8 @@ export function classifyKnownTask(state, task, remote, projectionOptions = {}) {
   };
 }
 
-function applyObservedAsanaState(task, result) {
-  const { observed, planHash, remoteHash } = result;
+function applyObservedAsanaState(state, task, result) {
+  const { observed, planHash } = result;
   task.asana.section_gid = observed.section_gid;
   task.asana.section_name = observed.section_name;
   task.asana.parent_gid = observed.parent_gid;
@@ -427,7 +439,9 @@ function applyObservedAsanaState(task, result) {
   task.asana.assignee_email = observed.assignee_email;
   task.asana.last_seen_at = observed.modified_at;
   task.asana.last_synced_plan_sha256 = planHash;
-  task.asana.last_synced_projection_sha256 = observedHash(observed, true, true);
+  task.asana.last_synced_projection_sha256 = synchronizationObservedHash(
+    state, task, observed, true, true,
+  );
   task.asana.sync_status = 'synchronized';
 }
 
@@ -968,7 +982,7 @@ async function pull(state, snapshot, apply, tasks) {
     receiptTasks.push(receiptTask(state, task, result));
     if (!apply) continue;
     if (result.kind === 'baseline_required' || result.kind === 'pull_required') {
-      applyObservedAsanaState(task, result);
+      applyObservedAsanaState(state, task, result);
       changed = true;
     }
   }

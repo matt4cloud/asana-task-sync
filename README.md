@@ -231,7 +231,10 @@ Successful bind changes only `asana.gid`. It does not copy operational fields
 or write sync hashes. Because bind requires both hashes to be `null` and
 preflights the same ordinary initial-pull classifier, the first ordinary fresh
 `pull --plan` after a successful bind is guaranteed to report
-`baseline_required`; follow it with the corresponding `pull --apply`.
+`baseline_required`; follow it with the corresponding `pull --apply`. If the
+remote note contains exactly the managed section without an operator heading,
+that first pull records the semantically equivalent canonical empty-operator
+projection as its baseline without changing the remote note.
 
 ### Pull operational state into JSON
 
