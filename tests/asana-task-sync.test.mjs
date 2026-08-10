@@ -14,6 +14,7 @@ import {
   renderManagedNotes,
   renderNotes,
   sha256,
+  stableJson,
 } from '../asana-task-sync.mjs';
 
 const target = {
@@ -120,6 +121,10 @@ function snapshot(tasks, scope = { kind: 'tasks' }, bindings = []) {
   };
 }
 
+function projectSnapshot(tasks, bindings = []) {
+  return snapshot(tasks, { kind: 'project' }, bindings);
+}
+
 function snapshotSubtask(remote) {
   return {
     gid: remote.gid,
@@ -168,6 +173,32 @@ function establishBaseline(controlState, controlledTask, remote) {
   controlledTask.asana.last_synced_plan_sha256 = result.planHash;
   controlledTask.asana.last_synced_projection_sha256 = result.remoteHash;
   controlledTask.asana.operator_notes = result.observed.operator_notes;
+}
+
+async function unboundFixture(prefix = 'asana-task-sync-bind-') {
+  const directory = await mkdtemp(join(tmpdir(), prefix));
+  const statePath = join(directory, 'TASK_CONTROL.json');
+  const envPath = join(directory, 'TASK_CONTROL.env');
+  const planReceiptPath = join(directory, 'bind-plan-receipt.json');
+  const controlState = attachRuntime(state());
+  const controlledTask = task({
+    asana: { ...task().asana, gid: null },
+  });
+  controlState.tasks = [controlledTask];
+  const remote = remoteFromTask(controlState, controlledTask, 'Remote operator note.');
+  remote.gid = 'asana-existing';
+  await writeFile(statePath, `${JSON.stringify(controlState, null, 2)}\n`, 'utf8');
+  const snapshotPath = await writeSnapshot(directory, projectSnapshot([remote]));
+  return {
+    directory,
+    statePath,
+    envPath,
+    planReceiptPath,
+    controlState,
+    controlledTask,
+    remote,
+    snapshotPath,
+  };
 }
 
 test('renderer keeps the operator-notes boundary outside controlled notes', () => {
@@ -1029,7 +1060,7 @@ test('pull apply on a mixed base does not reject the receipt over not-yet-export
   });
   controlState.tasks = [controlledTask, notExportedTask];
   await writeFile(statePath, `${JSON.stringify(controlState, null, 2)}\n`, 'utf8');
-  const snapshotPath = await writeSnapshot(directory, snapshot([remote]));
+  const snapshotPath = await writeSnapshot(directory, projectSnapshot([remote]));
   const planReceiptPath = join(directory, 'pull-plan-receipt.json');
 
   try {
@@ -1258,7 +1289,7 @@ test('a new task uses the instance default assignee only when its own assignment
     asana: { ...task().asana, gid: null, last_synced_plan_sha256: null, last_synced_projection_sha256: null },
   })]);
   await writeFile(statePath, `${JSON.stringify(controlState, null, 2)}\n`, 'utf8');
-  const snapshotPath = await writeSnapshot(directory, snapshot([]));
+  const snapshotPath = await writeSnapshot(directory, projectSnapshot([]));
 
   try {
     const plan = await main(['push', '--plan', '--snapshot', snapshotPath, '--env', envPath], environment('TASK_CONTROL.json'));
@@ -1291,7 +1322,7 @@ test('a new task own assignment overrides the fallback and an explicit null stay
   });
   const controlState = state([explicitAssigneeTask]);
   await writeFile(statePath, `${JSON.stringify(controlState, null, 2)}\n`, 'utf8');
-  const snapshotPath = await writeSnapshot(directory, snapshot([]));
+  const snapshotPath = await writeSnapshot(directory, projectSnapshot([]));
 
   try {
     const explicitPlan = await main(['push', '--plan', '--snapshot', snapshotPath, '--env', envPath], environment('TASK_CONTROL.json'));
@@ -1324,7 +1355,7 @@ test('a new subtask is created under its parent instead of a project section', a
   });
   const controlState = state([subtask]);
   await writeFile(statePath, `${JSON.stringify(controlState, null, 2)}\n`, 'utf8');
-  const snapshotPath = await writeSnapshot(directory, snapshot([]));
+  const snapshotPath = await writeSnapshot(directory, projectSnapshot([]));
 
   try {
     const plan = await main(['push', '--plan', '--snapshot', snapshotPath, '--env', envPath], environment('TASK_CONTROL.json'));
@@ -1475,6 +1506,9 @@ test('the machine snapshot contract requires only the parent GID', async () => {
   assert.equal(schema.$defs.task.properties.parent.oneOf[0].$ref, '#/$defs/parent');
   assert.equal(schema.$defs.parent.properties.gid.minLength, 1);
   assert.equal(schema.$defs.parent.properties.name.minLength, undefined);
+  assert.equal(schema.properties.scope.oneOf.some((entry) => (
+    entry.properties?.kind?.const === 'project'
+  )), true);
 });
 
 test('push plan and apply reconcile an existing subtask through its parent, not a section', async () => {
@@ -1535,5 +1569,763 @@ test('push plan and apply reconcile an existing subtask through its parent, not 
     assert.equal(saved.tasks[0].asana.sync_status, 'synchronized');
   } finally {
     await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('full pull and push plans report an exact unbound remote without creating a duplicate', async () => {
+  const fixture = await unboundFixture('asana-task-sync-remote-unbound-');
+  try {
+    const before = await readFile(fixture.statePath, 'utf8');
+    const pullPlan = await main([
+      'pull', '--plan', '--snapshot', fixture.snapshotPath, '--env', fixture.envPath,
+    ], environment('TASK_CONTROL.json'));
+    assert.deepEqual(pullPlan.tasks[0], {
+      id: 'task-1',
+      asana_gid: null,
+      action: 'remote_unbound',
+      reason: 'controlled_plan_identity_matches',
+      candidate_asana_gid: 'asana-existing',
+    });
+
+    const pushPlan = await main([
+      'push', '--plan', '--snapshot', fixture.snapshotPath, '--env', fixture.envPath,
+    ], environment('TASK_CONTROL.json'));
+    assert.equal(pushPlan.tasks[0].action, 'remote_unbound');
+    assert.deepEqual(pushPlan.mcp_operations, []);
+    assert.equal(await readFile(fixture.statePath, 'utf8'), before);
+  } finally {
+    await rm(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test('managed-only remote notes without an operator heading support pull, push, and bind', async () => {
+  const fixture = await unboundFixture('asana-task-sync-managed-only-notes-');
+  try {
+    fixture.remote.notes = `${renderManagedNotes(fixture.controlState, fixture.controlledTask)}\n`;
+    await writeFile(
+      fixture.snapshotPath, `${JSON.stringify(projectSnapshot([fixture.remote]), null, 2)}\n`, 'utf8',
+    );
+
+    const pullPlan = await main([
+      'pull', '--plan', '--snapshot', fixture.snapshotPath, '--env', fixture.envPath,
+    ], environment('TASK_CONTROL.json'));
+    assert.equal(pullPlan.tasks[0].action, 'remote_unbound');
+
+    const pushPlan = await main([
+      'push', '--plan', '--snapshot', fixture.snapshotPath, '--env', fixture.envPath,
+    ], environment('TASK_CONTROL.json'));
+    assert.equal(pushPlan.tasks[0].action, 'remote_unbound');
+    assert.deepEqual(pushPlan.mcp_operations, []);
+
+    const bindPlan = await main([
+      'bind', '--plan', '--task', 'task-1', '--gid', 'asana-existing',
+      '--snapshot', fixture.snapshotPath, '--plan-receipt', fixture.planReceiptPath,
+      '--env', fixture.envPath,
+    ], environment('TASK_CONTROL.json'));
+    assert.equal(bindPlan.tasks[0].action, 'bind_required');
+
+    const bindApply = await main([
+      'bind', '--apply', '--go', 'GO_BIND', '--task', 'task-1', '--gid', 'asana-existing',
+      '--snapshot', fixture.snapshotPath, '--plan-receipt', fixture.planReceiptPath,
+      '--env', fixture.envPath,
+    ], environment('TASK_CONTROL.json'));
+    assert.equal(bindApply.tasks[0].action, 'bound');
+
+    const pullAfterBind = await main([
+      'pull', '--plan', '--snapshot', fixture.snapshotPath, '--env', fixture.envPath,
+    ], environment('TASK_CONTROL.json'));
+    assert.equal(pullAfterBind.tasks[0].action, 'baseline_required');
+  } finally {
+    await rm(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test('unmarked text after managed notes is not a controlled identity and cannot bind', async () => {
+  const fixture = await unboundFixture('asana-task-sync-unmarked-notes-suffix-');
+  try {
+    fixture.remote.notes = `${renderManagedNotes(fixture.controlState, fixture.controlledTask)}\n\nUnmarked remote text.`;
+    await writeFile(
+      fixture.snapshotPath, `${JSON.stringify(projectSnapshot([fixture.remote]), null, 2)}\n`, 'utf8',
+    );
+    const before = await readFile(fixture.statePath, 'utf8');
+
+    const pullPlan = await main([
+      'pull', '--plan', '--snapshot', fixture.snapshotPath, '--env', fixture.envPath,
+    ], environment('TASK_CONTROL.json'));
+    assert.equal(pullPlan.tasks[0].action, 'not_exported');
+
+    const bindPlan = await main([
+      'bind', '--plan', '--task', 'task-1', '--gid', 'asana-existing',
+      '--snapshot', fixture.snapshotPath, '--plan-receipt', fixture.planReceiptPath,
+      '--env', fixture.envPath,
+    ], environment('TASK_CONTROL.json'));
+    assert.equal(bindPlan.tasks[0].action, 'conflict');
+    assert.equal(bindPlan.tasks[0].reason, 'controlled_plan_identity_mismatch');
+    assert.equal(bindPlan.plan_receipt_path, undefined);
+    await assert.rejects(readFile(fixture.planReceiptPath, 'utf8'), { code: 'ENOENT' });
+    assert.equal(await readFile(fixture.statePath, 'utf8'), before);
+
+  } finally {
+    await rm(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test('legacy bound databases without a rendered Plan ID remain valid for validate, pull, and push', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'asana-task-sync-legacy-bound-'));
+  const statePath = join(directory, 'TASK_CONTROL.json');
+  const envPath = join(directory, 'TASK_CONTROL.env');
+  const controlState = attachRuntime(state());
+  controlState.rendering.managed_fields = managedFields.filter((field) => field.path !== 'id');
+  const controlledTask = task();
+  const remote = remoteFromTask(controlState, controlledTask);
+  establishBaseline(controlState, controlledTask, remote);
+  controlState.tasks = [controlledTask];
+  await writeFile(statePath, `${JSON.stringify(controlState, null, 2)}\n`, 'utf8');
+  const snapshotPath = await writeSnapshot(directory, snapshot([remote]));
+
+  try {
+    const validation = await main([
+      'validate', '--env', envPath,
+    ], environment('TASK_CONTROL.json'));
+    assert.equal(validation.tasks, 1);
+
+    const pullPlan = await main([
+      'pull', '--plan', '--snapshot', snapshotPath, '--env', envPath,
+    ], environment('TASK_CONTROL.json'));
+    assert.equal(pullPlan.tasks[0].action, 'synchronized');
+
+    const pushPlan = await main([
+      'push', '--plan', '--snapshot', snapshotPath, '--env', envPath,
+    ], environment('TASK_CONTROL.json'));
+    assert.equal(pushPlan.tasks[0].action, 'synchronized');
+    assert.equal(pushPlan.mcp_operations.some((operation) => operation.operation === 'create_task'), false);
+
+    const schemaPath = fileURLToPath(new URL('../task-control.schema.json', import.meta.url));
+    const schema = JSON.parse(await readFile(schemaPath, 'utf8'));
+    assert.equal(schema.properties.rendering.properties.managed_fields.allOf, undefined);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('bind apply changes only asana.gid and leaves reconciliation to pull', async () => {
+  const fixture = await unboundFixture('asana-task-sync-bind-apply-');
+  try {
+    const before = JSON.parse(await readFile(fixture.statePath, 'utf8'));
+    const plan = await main([
+      'bind', '--plan', '--task', 'task-1', '--gid', 'asana-existing',
+      '--snapshot', fixture.snapshotPath, '--plan-receipt', fixture.planReceiptPath,
+      '--env', fixture.envPath,
+    ], environment('TASK_CONTROL.json'));
+    assert.equal(plan.tasks[0].action, 'bind_required');
+    assert.equal(plan.changed_json, false);
+    const bindReceipt = JSON.parse(await readFile(fixture.planReceiptPath, 'utf8'));
+    assert.deepEqual(bindReceipt.target_project, target.project);
+
+    const applied = await main([
+      'bind', '--apply', '--go', 'GO_BIND', '--task', 'task-1', '--gid', 'asana-existing',
+      '--snapshot', fixture.snapshotPath, '--plan-receipt', fixture.planReceiptPath,
+      '--env', fixture.envPath,
+    ], environment('TASK_CONTROL.json'));
+    assert.equal(applied.tasks[0].action, 'bound');
+    assert.equal(applied.changed_json, true);
+    const savedAfterBind = JSON.parse(await readFile(fixture.statePath, 'utf8'));
+    const expected = JSON.parse(JSON.stringify(before));
+    expected.tasks[0].asana.gid = 'asana-existing';
+    assert.deepEqual(savedAfterBind, expected);
+
+    const pushPlan = await main([
+      'push', '--plan', '--snapshot', fixture.snapshotPath, '--env', fixture.envPath,
+    ], environment('TASK_CONTROL.json'));
+    assert.equal(pushPlan.tasks[0].action, 'baseline_required');
+    assert.equal(pushPlan.mcp_operations.some((operation) => operation.operation === 'create_task'), false);
+
+    const pullReceiptPath = join(fixture.directory, 'pull-after-bind-receipt.json');
+    const pullPlan = await main([
+      'pull', '--plan', '--snapshot', fixture.snapshotPath,
+      '--plan-receipt', pullReceiptPath, '--env', fixture.envPath,
+    ], environment('TASK_CONTROL.json'));
+    assert.equal(pullPlan.tasks[0].action, 'baseline_required');
+    const pullApply = await main([
+      'pull', '--apply', '--go', 'GO_PULL', '--snapshot', fixture.snapshotPath,
+      '--plan-receipt', pullReceiptPath, '--env', fixture.envPath,
+    ], environment('TASK_CONTROL.json'));
+    assert.equal(pullApply.changed_json, true);
+    const reconciled = JSON.parse(await readFile(fixture.statePath, 'utf8'));
+    assert.equal(reconciled.tasks[0].asana.gid, 'asana-existing');
+    assert.equal(reconciled.tasks[0].asana.sync_status, 'synchronized');
+    assert.equal(reconciled.tasks[0].asana.operator_notes, 'Remote operator note.');
+  } finally {
+    await rm(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test('bind rejects local section states that cannot produce the promised post-bind baseline pull', async () => {
+  const scenarios = [
+    {
+      name: 'null-gid-with-name',
+      mutate(asana) {
+        asana.section_gid = null;
+        asana.section_name = 'TO DO';
+      },
+    },
+    {
+      name: 'gid-with-null-name',
+      mutate(asana) {
+        asana.section_gid = 'section-todo';
+        asana.section_name = null;
+      },
+    },
+    {
+      name: 'missing-gid',
+      mutate(asana) {
+        delete asana.section_gid;
+      },
+    },
+    {
+      name: 'missing-name',
+      mutate(asana) {
+        delete asana.section_name;
+      },
+    },
+    {
+      name: 'missing-both',
+      mutate(asana) {
+        delete asana.section_gid;
+        delete asana.section_name;
+      },
+    },
+  ];
+
+  for (const scenario of scenarios) {
+    const fixture = await unboundFixture(`asana-task-sync-bind-post-pull-${scenario.name}-`);
+    try {
+      const persisted = JSON.parse(await readFile(fixture.statePath, 'utf8'));
+      scenario.mutate(persisted.tasks[0].asana);
+      await writeFile(fixture.statePath, `${JSON.stringify(persisted, null, 2)}\n`, 'utf8');
+      const before = await readFile(fixture.statePath, 'utf8');
+
+      const validation = await main([
+        'validate', '--env', fixture.envPath,
+      ], environment('TASK_CONTROL.json'));
+      assert.equal(validation.tasks, 1);
+
+      const plan = await main([
+        'bind', '--plan', '--task', 'task-1', '--gid', 'asana-existing',
+        '--snapshot', fixture.snapshotPath, '--plan-receipt', fixture.planReceiptPath,
+        '--env', fixture.envPath,
+      ], environment('TASK_CONTROL.json'));
+
+      assert.equal(plan.tasks[0].action, 'conflict');
+      assert.equal(plan.tasks[0].reason, 'post_bind_pull_not_baseline_required');
+      assert.match(
+        plan.tasks[0].post_bind_pull_error,
+        /requires an explicit asana\.section_gid and asana\.section_name before push/,
+      );
+      assert.equal(plan.changed_json, false);
+      assert.equal(plan.plan_receipt_path, undefined);
+      await assert.rejects(readFile(fixture.planReceiptPath, 'utf8'), { code: 'ENOENT' });
+      assert.equal(await readFile(fixture.statePath, 'utf8'), before);
+      assert.equal(JSON.parse(before).tasks[0].asana.gid, null);
+    } finally {
+      await rm(fixture.directory, { recursive: true, force: true });
+    }
+  }
+});
+
+test('bind rejects a mismatched controlled identity, missing GID, occupied GID, and rebinding', async () => {
+  for (const scenario of ['identity', 'title', 'missing', 'occupied', 'rebind']) {
+    const fixture = await unboundFixture(`asana-task-sync-bind-${scenario}-`);
+    try {
+      const persisted = JSON.parse(await readFile(fixture.statePath, 'utf8'));
+      let requestedGid = 'asana-existing';
+      let expectedReason;
+      if (scenario === 'identity') {
+        const badRemote = { ...fixture.remote, notes: fixture.remote.notes.replace('Plan ID: task-1', 'Plan ID: wrong-id') };
+        await writeFile(fixture.snapshotPath, `${JSON.stringify(projectSnapshot([badRemote]), null, 2)}\n`, 'utf8');
+        expectedReason = 'controlled_plan_identity_mismatch';
+      } else if (scenario === 'title') {
+        const badRemote = { ...fixture.remote, name: '[demo] Different title' };
+        await writeFile(fixture.snapshotPath, `${JSON.stringify(projectSnapshot([badRemote]), null, 2)}\n`, 'utf8');
+        expectedReason = 'controlled_plan_identity_mismatch';
+      } else if (scenario === 'missing') {
+        requestedGid = 'asana-absent';
+        expectedReason = 'asana_gid_not_in_snapshot';
+      } else if (scenario === 'occupied') {
+        persisted.tasks.push(task({
+          id: 'task-2',
+          title: 'Other local task',
+          asana: { ...task().asana, gid: 'asana-existing' },
+        }));
+        await writeFile(fixture.statePath, `${JSON.stringify(persisted, null, 2)}\n`, 'utf8');
+        expectedReason = 'asana_gid_already_bound_to_other_local_task';
+      } else {
+        persisted.tasks[0].asana.gid = 'asana-other';
+        await writeFile(fixture.statePath, `${JSON.stringify(persisted, null, 2)}\n`, 'utf8');
+        expectedReason = 'local_task_already_bound_to_different_gid';
+      }
+      const before = await readFile(fixture.statePath, 'utf8');
+      const plan = await main([
+        'bind', '--plan', '--task', 'task-1', '--gid', requestedGid,
+        '--snapshot', fixture.snapshotPath, '--env', fixture.envPath,
+      ], environment('TASK_CONTROL.json'));
+      assert.equal(plan.tasks[0].action, 'conflict');
+      assert.equal(plan.tasks[0].reason, expectedReason);
+      assert.equal(plan.changed_json, false);
+      assert.equal(await readFile(fixture.statePath, 'utf8'), before);
+    } finally {
+      await rm(fixture.directory, { recursive: true, force: true });
+    }
+  }
+});
+
+test('remote discovery never matches by title alone and reports duplicate controlled identities as ambiguous', async () => {
+  const fixture = await unboundFixture('asana-task-sync-bind-ambiguity-');
+  try {
+    const wrongIdentity = {
+      ...fixture.remote,
+      gid: 'asana-wrong-plan-id',
+      notes: fixture.remote.notes.replace('Plan ID: task-1', 'Plan ID: wrong-id'),
+    };
+    let snapshotPath = await writeSnapshot(fixture.directory, projectSnapshot([wrongIdentity]));
+    let plan = await main([
+      'pull', '--plan', '--snapshot', snapshotPath, '--env', fixture.envPath,
+    ], environment('TASK_CONTROL.json'));
+    assert.equal(plan.tasks[0].action, 'not_exported');
+
+    const duplicate = { ...fixture.remote, gid: 'asana-existing-2' };
+    snapshotPath = await writeSnapshot(fixture.directory, projectSnapshot([fixture.remote, duplicate]));
+    plan = await main([
+      'pull', '--plan', '--snapshot', snapshotPath, '--env', fixture.envPath,
+    ], environment('TASK_CONTROL.json'));
+    assert.equal(plan.tasks[0].action, 'conflict');
+    assert.equal(plan.tasks[0].reason, 'ambiguous_remote_match');
+    assert.deepEqual(plan.tasks[0].candidate_asana_gids, ['asana-existing', 'asana-existing-2']);
+
+    const beforeBind = await readFile(fixture.statePath, 'utf8');
+    const bindPlan = await main([
+      'bind', '--plan', '--task', 'task-1', '--gid', 'asana-existing',
+      '--snapshot', snapshotPath, '--plan-receipt', fixture.planReceiptPath,
+      '--env', fixture.envPath,
+    ], environment('TASK_CONTROL.json'));
+    assert.equal(bindPlan.tasks[0].action, 'conflict');
+    assert.equal(bindPlan.tasks[0].reason, 'ambiguous_remote_match');
+    assert.deepEqual(
+      bindPlan.tasks[0].candidate_asana_gids, ['asana-existing', 'asana-existing-2'],
+    );
+    assert.equal(bindPlan.plan_receipt_path, undefined);
+    await assert.rejects(readFile(fixture.planReceiptPath, 'utf8'), { code: 'ENOENT' });
+    assert.equal(await readFile(fixture.statePath, 'utf8'), beforeBind);
+  } finally {
+    await rm(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test('bind apply blocks when a second controlled-identity match appears after planning', async () => {
+  const fixture = await unboundFixture('asana-task-sync-bind-remote-set-drift-');
+  try {
+    const before = await readFile(fixture.statePath, 'utf8');
+    await main([
+      'bind', '--plan', '--task', 'task-1', '--gid', 'asana-existing',
+      '--snapshot', fixture.snapshotPath, '--plan-receipt', fixture.planReceiptPath,
+      '--env', fixture.envPath,
+    ], environment('TASK_CONTROL.json'));
+    const receipt = JSON.parse(await readFile(fixture.planReceiptPath, 'utf8'));
+    assert.deepEqual(receipt.tasks[0].planned_remote_scope, { kind: 'project' });
+    assert.deepEqual(receipt.tasks[0].planned_matching_remote_gids, ['asana-existing']);
+
+    const duplicate = { ...fixture.remote, gid: 'asana-existing-2' };
+    await writeFile(
+      fixture.snapshotPath,
+      `${JSON.stringify(projectSnapshot([fixture.remote, duplicate]), null, 2)}\n`,
+      'utf8',
+    );
+    const applied = await main([
+      'bind', '--apply', '--go', 'GO_BIND', '--task', 'task-1', '--gid', 'asana-existing',
+      '--snapshot', fixture.snapshotPath, '--plan-receipt', fixture.planReceiptPath,
+      '--env', fixture.envPath,
+    ], environment('TASK_CONTROL.json'));
+
+    assert.equal(applied.blocked, true);
+    assert.equal(applied.reason, 'state_changed_after_plan');
+    assert.equal(applied.changed_json, false);
+    assert.equal(applied.decision_required_diff.some((entry) => (
+      entry.source === 'asana'
+        && entry.field === 'controlled_identity_matching_gids'
+        && stableJson(entry.planned_asana) === stableJson(['asana-existing'])
+        && stableJson(entry.current_asana) === stableJson(['asana-existing', 'asana-existing-2'])
+    )), true);
+    assert.equal(await readFile(fixture.statePath, 'utf8'), before);
+  } finally {
+    await rm(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test('remote discovery and bind reject a partial snapshot without writing JSON or a receipt', async () => {
+  const fixture = await unboundFixture('asana-task-sync-bind-partial-snapshot-');
+  try {
+    await writeFile(
+      fixture.snapshotPath, `${JSON.stringify(snapshot([fixture.remote]), null, 2)}\n`, 'utf8',
+    );
+    const before = await readFile(fixture.statePath, 'utf8');
+
+    const pullPlan = await main([
+      'pull', '--plan', '--snapshot', fixture.snapshotPath, '--env', fixture.envPath,
+    ], environment('TASK_CONTROL.json'));
+    assert.equal(pullPlan.tasks[0].action, 'conflict');
+    assert.equal(pullPlan.tasks[0].reason, 'full_project_snapshot_required');
+
+    const pushPlan = await main([
+      'push', '--plan', '--snapshot', fixture.snapshotPath, '--env', fixture.envPath,
+    ], environment('TASK_CONTROL.json'));
+    assert.equal(pushPlan.tasks[0].action, 'conflict');
+    assert.equal(pushPlan.tasks[0].reason, 'full_project_snapshot_required');
+    assert.deepEqual(pushPlan.mcp_operations, []);
+
+    const bindPlan = await main([
+      'bind', '--plan', '--task', 'task-1', '--gid', 'asana-existing',
+      '--snapshot', fixture.snapshotPath, '--plan-receipt', fixture.planReceiptPath,
+      '--env', fixture.envPath,
+    ], environment('TASK_CONTROL.json'));
+    assert.equal(bindPlan.tasks[0].action, 'conflict');
+    assert.equal(bindPlan.tasks[0].reason, 'full_project_snapshot_required');
+    assert.equal(bindPlan.plan_receipt_path, undefined);
+    await assert.rejects(readFile(fixture.planReceiptPath, 'utf8'), { code: 'ENOENT' });
+    assert.equal(await readFile(fixture.statePath, 'utf8'), before);
+
+    await writeFile(
+      fixture.snapshotPath,
+      `${JSON.stringify(projectSnapshot([fixture.remote]), null, 2)}\n`,
+      'utf8',
+    );
+    await main([
+      'bind', '--plan', '--task', 'task-1', '--gid', 'asana-existing',
+      '--snapshot', fixture.snapshotPath, '--plan-receipt', fixture.planReceiptPath,
+      '--env', fixture.envPath,
+    ], environment('TASK_CONTROL.json'));
+    await writeFile(
+      fixture.snapshotPath, `${JSON.stringify(snapshot([fixture.remote]), null, 2)}\n`, 'utf8',
+    );
+    const applied = await main([
+      'bind', '--apply', '--go', 'GO_BIND', '--task', 'task-1', '--gid', 'asana-existing',
+      '--snapshot', fixture.snapshotPath, '--plan-receipt', fixture.planReceiptPath,
+      '--env', fixture.envPath,
+    ], environment('TASK_CONTROL.json'));
+    assert.equal(applied.blocked, true);
+    assert.equal(applied.changed_json, false);
+    assert.equal(applied.decision_required_diff.some((entry) => (
+      entry.source === 'asana'
+        && entry.field === 'snapshot_scope'
+        && entry.planned_asana?.kind === 'project'
+        && entry.current_asana?.kind === 'tasks'
+    )), true);
+    assert.equal(await readFile(fixture.statePath, 'utf8'), before);
+  } finally {
+    await rm(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test('a legacy unbound record without canonical Plan ID still creates while explicit bind is rejected', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'asana-task-sync-legacy-unbound-create-'));
+  const statePath = join(directory, 'TASK_CONTROL.json');
+  const envPath = join(directory, 'TASK_CONTROL.env');
+  const bindReceiptPath = join(directory, 'bind-plan-receipt.json');
+  const controlState = attachRuntime(state());
+  controlState.sync.plan_fields = ['id', 'title'];
+  controlState.rendering.managed_fields = [
+    { label: 'Title', path: 'title', style: 'inline', format: 'text' },
+  ];
+  const controlledTask = task({
+    id: 'legacy-task',
+    title: 'Legacy new task',
+    asana: { ...task().asana, gid: null },
+  });
+  controlState.tasks = [controlledTask];
+  const snapshotPath = await writeSnapshot(directory, snapshot([]));
+  await writeFile(statePath, `${JSON.stringify(controlState, null, 2)}\n`, 'utf8');
+  const before = await readFile(statePath, 'utf8');
+  try {
+    const validation = await main([
+      'validate', '--env', envPath,
+    ], environment('TASK_CONTROL.json'));
+    assert.equal(validation.tasks, 1);
+
+    const pullPlan = await main([
+      'pull', '--plan', '--snapshot', snapshotPath, '--env', envPath,
+    ], environment('TASK_CONTROL.json'));
+    assert.deepEqual(pullPlan.tasks[0], {
+      id: 'legacy-task', asana_gid: null, action: 'not_exported', reason: 'no_asana_gid',
+    });
+
+    const pushPlan = await main([
+      'push', '--plan', '--snapshot', snapshotPath, '--env', envPath,
+    ], environment('TASK_CONTROL.json'));
+    assert.equal(pushPlan.tasks[0].action, 'create_required');
+    assert.equal(pushPlan.tasks[0].reason, 'not_exported');
+    assert.equal(pushPlan.mcp_operations.length, 1);
+    assert.equal(pushPlan.mcp_operations[0].operation, 'create_task');
+
+    const remote = remoteFromTask(controlState, controlledTask);
+    remote.gid = 'remote-1';
+    await writeFile(snapshotPath, `${JSON.stringify(snapshot([remote]), null, 2)}\n`, 'utf8');
+
+    const bindPlan = await main([
+      'bind', '--plan', '--task', 'legacy-task', '--gid', 'remote-1',
+      '--snapshot', snapshotPath, '--plan-receipt', bindReceiptPath, '--env', envPath,
+    ], environment('TASK_CONTROL.json'));
+    assert.equal(bindPlan.tasks[0].action, 'conflict');
+    assert.equal(bindPlan.tasks[0].reason, 'noncanonical_controlled_plan_id');
+    assert.equal(bindPlan.plan_receipt_path, undefined);
+    await assert.rejects(
+      main([
+        'bind', '--apply', '--go', 'GO_BIND', '--task', 'legacy-task', '--gid', 'remote-1',
+        '--snapshot', snapshotPath, '--plan-receipt', bindReceiptPath, '--env', envPath,
+      ], environment('TASK_CONTROL.json')),
+      /ENOENT/,
+    );
+    await assert.rejects(readFile(bindReceiptPath, 'utf8'), { code: 'ENOENT' });
+    assert.equal(await readFile(statePath, 'utf8'), before);
+    assert.equal(JSON.parse(before).tasks[0].asana.gid, null);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('bind apply blocks local, remote, and GID-owner drift after planning', async () => {
+  for (const scenario of ['local', 'remote', 'owner']) {
+    const fixture = await unboundFixture(`asana-task-sync-bind-drift-${scenario}-`);
+    try {
+      await main([
+        'bind', '--plan', '--task', 'task-1', '--gid', 'asana-existing',
+        '--snapshot', fixture.snapshotPath, '--plan-receipt', fixture.planReceiptPath,
+        '--env', fixture.envPath,
+      ], environment('TASK_CONTROL.json'));
+      if (scenario === 'remote') {
+        const changedRemote = { ...fixture.remote, name: '[demo] Changed remotely' };
+        await writeFile(
+          fixture.snapshotPath,
+          `${JSON.stringify(projectSnapshot([changedRemote]), null, 2)}\n`,
+          'utf8',
+        );
+      } else {
+        const changed = JSON.parse(await readFile(fixture.statePath, 'utf8'));
+        if (scenario === 'local') changed.tasks[0].goal = 'Changed after plan.';
+        else {
+          changed.tasks.push(task({
+            id: 'task-2',
+            title: 'Other local task',
+            asana: { ...task().asana, gid: 'asana-existing' },
+          }));
+        }
+        await writeFile(fixture.statePath, `${JSON.stringify(changed, null, 2)}\n`, 'utf8');
+      }
+      const applied = await main([
+        'bind', '--apply', '--go', 'GO_BIND', '--task', 'task-1', '--gid', 'asana-existing',
+        '--snapshot', fixture.snapshotPath, '--plan-receipt', fixture.planReceiptPath,
+        '--env', fixture.envPath,
+      ], environment('TASK_CONTROL.json'));
+      assert.equal(applied.blocked, true);
+      assert.equal(applied.changed_json, false);
+      const saved = JSON.parse(await readFile(fixture.statePath, 'utf8'));
+      assert.equal(saved.tasks.find((entry) => entry.id === 'task-1').asana.gid, null);
+    } finally {
+      await rm(fixture.directory, { recursive: true, force: true });
+    }
+  }
+});
+
+test('bind apply blocks configured-project drift after planning without writing JSON', async () => {
+  const fixture = await unboundFixture('asana-task-sync-bind-project-drift-');
+  try {
+    await main([
+      'bind', '--plan', '--task', 'task-1', '--gid', 'asana-existing',
+      '--snapshot', fixture.snapshotPath, '--plan-receipt', fixture.planReceiptPath,
+      '--env', fixture.envPath,
+    ], environment('TASK_CONTROL.json'));
+    const projectTwo = { gid: 'project-2', name: 'Project Two' };
+    const projectTwoSnapshot = projectSnapshot([fixture.remote]);
+    projectTwoSnapshot.target = {
+      project: projectTwo,
+      assignee: { ...target.assignee },
+    };
+    await writeFile(
+      fixture.snapshotPath, `${JSON.stringify(projectTwoSnapshot, null, 2)}\n`, 'utf8',
+    );
+    const beforeApply = await readFile(fixture.statePath, 'utf8');
+    const retargetedEnvironment = {
+      ...environment('TASK_CONTROL.json'),
+      ASANA_PROJECT_GID: projectTwo.gid,
+      ASANA_PROJECT_NAME: projectTwo.name,
+    };
+
+    const applied = await main([
+      'bind', '--apply', '--go', 'GO_BIND', '--task', 'task-1', '--gid', 'asana-existing',
+      '--snapshot', fixture.snapshotPath, '--plan-receipt', fixture.planReceiptPath,
+      '--env', fixture.envPath,
+    ], retargetedEnvironment);
+
+    assert.equal(applied.blocked, true);
+    assert.equal(applied.reason, 'state_changed_after_plan');
+    assert.equal(applied.changed_json, false);
+    assert.equal(applied.decision_required_diff.some((entry) => (
+      entry.source === 'configuration'
+        && entry.field === 'gid'
+        && entry.planned_configuration === target.project.gid
+        && entry.current_configuration === projectTwo.gid
+    )), true);
+    assert.equal(applied.decision_required_diff.some((entry) => (
+      entry.source === 'configuration'
+        && entry.field === 'name'
+        && entry.planned_configuration === target.project.name
+        && entry.current_configuration === projectTwo.name
+    )), true);
+    assert.equal(await readFile(fixture.statePath, 'utf8'), beforeApply);
+    const saved = JSON.parse(beforeApply);
+    assert.equal(saved.tasks[0].asana.gid, null);
+  } finally {
+    await rm(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test('bind rejects every residual synchronization-hash state for an unbound task', async () => {
+  const scenarios = [
+    { name: 'plan-only', plan: 'a'.repeat(64), projection: null },
+    { name: 'projection-only', plan: null, projection: 'b'.repeat(64) },
+    { name: 'both', plan: 'a'.repeat(64), projection: 'b'.repeat(64) },
+  ];
+  for (const scenario of scenarios) {
+    const fixture = await unboundFixture(`asana-task-sync-bind-residual-${scenario.name}-`);
+    try {
+      const persisted = JSON.parse(await readFile(fixture.statePath, 'utf8'));
+      persisted.tasks[0].asana.last_synced_plan_sha256 = scenario.plan;
+      persisted.tasks[0].asana.last_synced_projection_sha256 = scenario.projection;
+      await writeFile(fixture.statePath, `${JSON.stringify(persisted, null, 2)}\n`, 'utf8');
+      const before = await readFile(fixture.statePath, 'utf8');
+
+      const plan = await main([
+        'bind', '--plan', '--task', 'task-1', '--gid', 'asana-existing',
+        '--snapshot', fixture.snapshotPath, '--env', fixture.envPath,
+      ], environment('TASK_CONTROL.json'));
+
+      assert.equal(plan.tasks[0].action, 'conflict');
+      assert.equal(plan.tasks[0].reason, 'unbound_task_has_residual_sync_baseline');
+      assert.deepEqual(plan.tasks[0].residual_sync_baseline, {
+        last_synced_plan_sha256: scenario.plan,
+        last_synced_projection_sha256: scenario.projection,
+      });
+      assert.equal(plan.changed_json, false);
+      assert.equal(await readFile(fixture.statePath, 'utf8'), before);
+      assert.equal(JSON.parse(before).tasks[0].asana.gid, null);
+    } finally {
+      await rm(fixture.directory, { recursive: true, force: true });
+    }
+  }
+});
+
+test('bind is idempotent and noncanonical Plan ID fields are rejected only by bind', async () => {
+  const fixture = await unboundFixture('asana-task-sync-bind-idempotent-');
+  try {
+    await main([
+      'bind', '--plan', '--task', 'task-1', '--gid', 'asana-existing',
+      '--snapshot', fixture.snapshotPath, '--plan-receipt', fixture.planReceiptPath,
+      '--env', fixture.envPath,
+    ], environment('TASK_CONTROL.json'));
+    await main([
+      'bind', '--apply', '--go', 'GO_BIND', '--task', 'task-1', '--gid', 'asana-existing',
+      '--snapshot', fixture.snapshotPath, '--plan-receipt', fixture.planReceiptPath,
+      '--env', fixture.envPath,
+    ], environment('TASK_CONTROL.json'));
+    const afterFirstBind = await readFile(fixture.statePath, 'utf8');
+    const secondReceipt = join(fixture.directory, 'second-bind-receipt.json');
+    const secondPlan = await main([
+      'bind', '--plan', '--task', 'task-1', '--gid', 'asana-existing',
+      '--snapshot', fixture.snapshotPath, '--plan-receipt', secondReceipt,
+      '--env', fixture.envPath,
+    ], environment('TASK_CONTROL.json'));
+    assert.equal(secondPlan.tasks[0].action, 'already_bound');
+    const secondApply = await main([
+      'bind', '--apply', '--go', 'GO_BIND_AGAIN', '--task', 'task-1', '--gid', 'asana-existing',
+      '--snapshot', fixture.snapshotPath, '--plan-receipt', secondReceipt,
+      '--env', fixture.envPath,
+    ], environment('TASK_CONTROL.json'));
+    assert.equal(secondApply.changed_json, false);
+    assert.equal(await readFile(fixture.statePath, 'utf8'), afterFirstBind);
+
+    const withoutPlanId = JSON.parse(afterFirstBind);
+    withoutPlanId.tasks[0].asana.gid = null;
+    withoutPlanId.rendering.managed_fields = withoutPlanId.rendering.managed_fields
+      .filter((field) => field.path !== 'id');
+    await writeFile(fixture.statePath, `${JSON.stringify(withoutPlanId, null, 2)}\n`, 'utf8');
+    const validationWithoutPlanId = await main([
+      'validate', '--env', fixture.envPath,
+    ], environment('TASK_CONTROL.json'));
+    assert.equal(validationWithoutPlanId.tasks, 1);
+    const bindWithoutPlanId = await main([
+      'bind', '--plan', '--task', 'task-1', '--gid', 'asana-existing',
+      '--snapshot', fixture.snapshotPath, '--env', fixture.envPath,
+    ], environment('TASK_CONTROL.json'));
+    assert.equal(bindWithoutPlanId.tasks[0].reason, 'noncanonical_controlled_plan_id');
+
+    withoutPlanId.rendering.managed_fields.push(
+      { label: 'Plan ID', path: 'id', style: 'inline', format: 'text' },
+      { label: 'Repeated Plan ID', path: 'id', style: 'inline', format: 'text' },
+    );
+    await writeFile(fixture.statePath, `${JSON.stringify(withoutPlanId, null, 2)}\n`, 'utf8');
+    const validationWithRepeatedPlanId = await main([
+      'validate', '--env', fixture.envPath,
+    ], environment('TASK_CONTROL.json'));
+    assert.equal(validationWithRepeatedPlanId.tasks, 1);
+    const bindWithRepeatedPlanId = await main([
+      'bind', '--plan', '--task', 'task-1', '--gid', 'asana-existing',
+      '--snapshot', fixture.snapshotPath, '--env', fixture.envPath,
+    ], environment('TASK_CONTROL.json'));
+    assert.equal(bindWithRepeatedPlanId.tasks[0].reason, 'noncanonical_controlled_plan_id');
+  } finally {
+    await rm(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test('bind rejects a snapshot for a foreign project without writing JSON', async () => {
+  const fixture = await unboundFixture('asana-task-sync-bind-foreign-project-');
+  try {
+    const foreignSnapshot = projectSnapshot([fixture.remote]);
+    foreignSnapshot.target = {
+      project: { gid: 'project-foreign', name: 'Foreign project' },
+      assignee: { ...target.assignee },
+    };
+    await writeFile(fixture.snapshotPath, `${JSON.stringify(foreignSnapshot, null, 2)}\n`, 'utf8');
+    const before = await readFile(fixture.statePath, 'utf8');
+    await assert.rejects(
+      main([
+        'bind', '--plan', '--task', 'task-1', '--gid', 'asana-existing',
+        '--snapshot', fixture.snapshotPath, '--env', fixture.envPath,
+      ], environment('TASK_CONTROL.json')),
+      /MCP snapshot project does not match the configured instance target/,
+    );
+    assert.equal(await readFile(fixture.statePath, 'utf8'), before);
+  } finally {
+    await rm(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test('bind apply requires both an explicit GO marker and its preceding receipt', async () => {
+  const fixture = await unboundFixture('asana-task-sync-bind-gates-');
+  try {
+    await assert.rejects(
+      main([
+        'bind', '--apply', '--task', 'task-1', '--gid', 'asana-existing',
+        '--snapshot', fixture.snapshotPath, '--env', fixture.envPath,
+      ], environment('TASK_CONTROL.json')),
+      /--apply requires --go <explicit-operator-go>/,
+    );
+    await assert.rejects(
+      main([
+        'bind', '--apply', '--go', 'GO_BIND', '--task', 'task-1', '--gid', 'asana-existing',
+        '--snapshot', fixture.snapshotPath, '--env', fixture.envPath,
+      ], environment('TASK_CONTROL.json')),
+      /bind --apply requires --plan-receipt PATH created by its preceding --plan/,
+    );
+  } finally {
+    await rm(fixture.directory, { recursive: true, force: true });
   }
 });

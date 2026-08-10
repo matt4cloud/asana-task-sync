@@ -35,6 +35,12 @@
           "required": ["kind"],
           "properties": { "kind": { "const": "tasks" } },
           "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["kind"],
+          "properties": { "kind": { "const": "project" } },
+          "additionalProperties": false
         }
       ]
     },

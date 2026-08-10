@@ -148,8 +148,129 @@ export function remoteProjection(state, task, remote) {
 
 export function controlledProjectionMatches(state, task, observed) {
   return observed.name === renderedTitle(state, task)
-    && observed.has_operator_heading
-    && observed.controlled_notes === renderManagedNotes(state, task);
+    && controlledNotesMatch(state, task, observed);
+}
+
+function hasCanonicalControlledPlanId(state) {
+  const planIdFields = state.rendering.managed_fields.filter((field) => field.path === 'id');
+  return planIdFields.length === 1 && planIdFields[0].format === 'text';
+}
+
+function controlledNotesMatch(state, task, observed) {
+  const expected = renderManagedNotes(state, task);
+  if (observed.has_operator_heading) return observed.controlled_notes === expected;
+  return observed.notes.trim() === expected;
+}
+
+function controlledBindIdentity(state, task, remote) {
+  const observed = remoteProjection(state, task, remote);
+  const managedOnlyNotes = !observed.has_operator_heading
+    && observed.notes.trim() === renderManagedNotes(state, task);
+  const expected = {
+    name: renderedTitle(state, task),
+    controlled_notes: renderManagedNotes(state, task),
+    has_operator_heading: observed.has_operator_heading,
+  };
+  const actual = {
+    name: observed.name,
+    controlled_notes: managedOnlyNotes ? observed.notes.trim() : observed.controlled_notes,
+    has_operator_heading: observed.has_operator_heading,
+  };
+  return {
+    expected,
+    actual,
+    matches: hasCanonicalControlledPlanId(state)
+      && (observed.has_operator_heading || managedOnlyNotes)
+      && stableJson(expected) === stableJson(actual),
+    diff: projectionDiff(expected, actual, 'json', 'asana'),
+  };
+}
+
+function localControlledIdentityMatches(state, remote, onlyUnbound = false) {
+  return state.tasks.filter((candidate) => (
+    (!onlyUnbound || !candidate.asana.gid)
+      && controlledBindIdentity(state, candidate, remote).matches
+  ));
+}
+
+function gidOwners(state, remoteGid) {
+  return state.tasks
+    .filter((task) => task.asana.gid === remoteGid)
+    .map((task) => task.id)
+    .sort();
+}
+
+function isFullProjectSnapshot(snapshot) {
+  return stableJson(snapshot.scope) === stableJson({ kind: 'project' });
+}
+
+function matchingRemoteGids(state, task, snapshot) {
+  return snapshot.remotes
+    .filter((remote) => controlledBindIdentity(state, task, remote).matches)
+    .map((remote) => remote.gid)
+    .sort();
+}
+
+function classifyRemoteUnbound(state, task, snapshot) {
+  if (!hasCanonicalControlledPlanId(state)) {
+    return { id: task.id, asana_gid: null, action: 'not_exported', reason: 'no_asana_gid' };
+  }
+  if (!isFullProjectSnapshot(snapshot)) {
+    return {
+      id: task.id,
+      asana_gid: null,
+      action: 'conflict',
+      reason: 'full_project_snapshot_required',
+      required_scope: { kind: 'project' },
+      actual_scope: snapshot.scope,
+    };
+  }
+  const matchingGids = matchingRemoteGids(state, task, snapshot);
+  if (matchingGids.length === 0) {
+    return { id: task.id, asana_gid: null, action: 'not_exported', reason: 'no_asana_gid' };
+  }
+  if (matchingGids.length > 1) {
+    return {
+      id: task.id,
+      asana_gid: null,
+      action: 'conflict',
+      reason: 'ambiguous_remote_match',
+      candidate_asana_gids: matchingGids,
+    };
+  }
+  const [matchingGid] = matchingGids;
+  const remote = snapshot.remotes.find((candidate) => candidate.gid === matchingGid);
+  const matchingLocalIds = localControlledIdentityMatches(state, remote, true)
+    .map((candidate) => candidate.id)
+    .sort();
+  if (matchingLocalIds.length > 1) {
+    return {
+      id: task.id,
+      asana_gid: null,
+      action: 'conflict',
+      reason: 'ambiguous_local_match',
+      candidate_asana_gid: remote.gid,
+      candidate_local_ids: matchingLocalIds,
+    };
+  }
+  const owners = gidOwners(state, remote.gid);
+  if (owners.length > 0) {
+    return {
+      id: task.id,
+      asana_gid: null,
+      action: 'conflict',
+      reason: 'matching_remote_gid_already_bound',
+      candidate_asana_gid: remote.gid,
+      bound_local_ids: owners,
+    };
+  }
+  return {
+    id: task.id,
+    asana_gid: null,
+    action: 'remote_unbound',
+    reason: 'controlled_plan_identity_matches',
+    candidate_asana_gid: remote.gid,
+  };
 }
 
 function projectionHash(projection) {
@@ -433,7 +554,7 @@ export function validateState(state) {
   const ids = state.tasks.map((task) => task.id);
   if (new Set(ids).size !== ids.length) throw new Error('Task IDs must be unique.');
   for (const task of state.tasks) {
-    if (!task.id || !task.title || !task.asana) {
+    if (typeof task.id !== 'string' || !task.id || !task.title || !task.asana) {
       throw new Error(`Task ${task.id} has an incomplete control-state object.`);
     }
     for (const field of state.rendering.managed_fields) {
@@ -671,6 +792,162 @@ function receiptTask(state, task, result) {
   };
 }
 
+function selectBindTask(state, taskSelector) {
+  if (!taskSelector || taskSelector.includes(',')) {
+    throw new Error('bind requires exactly one stable local id through --task.');
+  }
+  const matches = state.tasks.filter((task) => task.id === taskSelector);
+  if (matches.length !== 1) {
+    throw new Error(`No unique local task matches bind --task ${taskSelector}. Use its stable local id.`);
+  }
+  return matches[0];
+}
+
+function bindConflict(state, task, remoteGid, snapshot) {
+  if (!hasCanonicalControlledPlanId(state)) {
+    return {
+      reason: 'noncanonical_controlled_plan_id',
+      requirement: 'rendering.managed_fields must contain exactly one Plan ID field with path "id" and format "text" for remote discovery or bind.',
+    };
+  }
+  if (!isFullProjectSnapshot(snapshot)) {
+    return {
+      reason: 'full_project_snapshot_required',
+      required_scope: { kind: 'project' },
+      actual_scope: snapshot.scope,
+    };
+  }
+  if (task.asana.gid && task.asana.gid !== remoteGid) {
+    return {
+      reason: 'local_task_already_bound_to_different_gid',
+      current_asana_gid: task.asana.gid,
+      requested_asana_gid: remoteGid,
+    };
+  }
+  if (!task.asana.gid && (
+    task.asana.last_synced_plan_sha256 != null
+    || task.asana.last_synced_projection_sha256 != null
+  )) {
+    return {
+      reason: 'unbound_task_has_residual_sync_baseline',
+      residual_sync_baseline: {
+        last_synced_plan_sha256: task.asana.last_synced_plan_sha256,
+        last_synced_projection_sha256: task.asana.last_synced_projection_sha256,
+      },
+    };
+  }
+  const owners = gidOwners(state, remoteGid);
+  const otherOwners = owners.filter((id) => id !== task.id);
+  if (otherOwners.length > 0) {
+    return {
+      reason: 'asana_gid_already_bound_to_other_local_task',
+      requested_asana_gid: remoteGid,
+      bound_local_ids: otherOwners,
+    };
+  }
+  const remote = snapshot.remotes.find((candidate) => candidate.gid === remoteGid);
+  if (!remote) {
+    return { reason: 'asana_gid_not_in_snapshot', requested_asana_gid: remoteGid };
+  }
+  const matchingGids = matchingRemoteGids(state, task, snapshot);
+  if (matchingGids.length > 1) {
+    return {
+      reason: 'ambiguous_remote_match',
+      requested_asana_gid: remoteGid,
+      candidate_asana_gids: matchingGids,
+    };
+  }
+  const identity = controlledBindIdentity(state, task, remote);
+  if (!identity.matches || matchingGids.length !== 1 || matchingGids[0] !== remoteGid) {
+    return {
+      reason: 'controlled_plan_identity_mismatch',
+      requested_asana_gid: remoteGid,
+      diff: identity.diff,
+    };
+  }
+  const matchingOtherLocalIds = localControlledIdentityMatches(state, remote)
+    .filter((candidate) => candidate !== task)
+    .map((candidate) => candidate.id)
+    .sort();
+  if (matchingOtherLocalIds.length > 0) {
+    return {
+      reason: 'ambiguous_local_match',
+      requested_asana_gid: remoteGid,
+      candidate_local_ids: [task.id, ...matchingOtherLocalIds].sort(),
+    };
+  }
+  if (!task.asana.gid) {
+    const postBindTask = JSON.parse(JSON.stringify(task));
+    postBindTask.asana.gid = remoteGid;
+    try {
+      const postBindPull = classifyKnownTask(state, postBindTask, remote, {
+        allowInitialPullWithoutSection: true,
+      });
+      if (postBindPull.kind !== 'baseline_required') {
+        return {
+          reason: 'post_bind_pull_not_baseline_required',
+          requested_asana_gid: remoteGid,
+          post_bind_pull_action: postBindPull.kind,
+          post_bind_pull_reason: postBindPull.reason,
+        };
+      }
+    } catch (error) {
+      return {
+        reason: 'post_bind_pull_not_baseline_required',
+        requested_asana_gid: remoteGid,
+        post_bind_pull_error: error.message,
+      };
+    }
+  }
+  return null;
+}
+
+function bindReceiptTask(state, task, remoteGid, remote, snapshot, action) {
+  const identity = controlledBindIdentity(state, task, remote);
+  return {
+    id: task.id,
+    asana_gid: remoteGid,
+    action,
+    planned_json_task: JSON.parse(JSON.stringify(task)),
+    planned_gid_owners: gidOwners(state, remoteGid),
+    planned_remote_scope: JSON.parse(JSON.stringify(snapshot.scope)),
+    planned_matching_remote_gids: matchingRemoteGids(state, task, snapshot),
+    observed_identity: identity.actual,
+  };
+}
+
+function bind(state, snapshot, apply, task, remoteGid) {
+  const conflict = bindConflict(state, task, remoteGid, snapshot);
+  if (conflict) {
+    return {
+      report: [{
+        id: task.id,
+        asana_gid: task.asana.gid,
+        action: 'conflict',
+        ...conflict,
+      }],
+      changed: false,
+      receipt_tasks: [],
+    };
+  }
+  const remote = snapshot.remotes.find((candidate) => candidate.gid === remoteGid);
+  const action = task.asana.gid === remoteGid ? 'already_bound' : 'bind_required';
+  const receiptTasks = [bindReceiptTask(state, task, remoteGid, remote, snapshot, action)];
+  if (apply && action === 'bind_required') task.asana.gid = remoteGid;
+  return {
+    report: [{
+      id: task.id,
+      asana_gid: remoteGid,
+      action: apply && action === 'bind_required' ? 'bound' : action,
+      reason: action === 'already_bound'
+        ? 'local_task_already_has_requested_gid'
+        : 'controlled_plan_identity_matches',
+    }],
+    changed: apply && action === 'bind_required',
+    receipt_tasks: receiptTasks,
+  };
+}
+
 async function pull(state, snapshot, apply, tasks) {
   const remoteByGid = new Map(snapshot.remotes.map((remote) => [remote.gid, remote]));
   const report = [];
@@ -678,7 +955,7 @@ async function pull(state, snapshot, apply, tasks) {
   const receiptTasks = [];
   for (const task of tasks) {
     if (!task.asana.gid) {
-      report.push({ id: task.id, asana_gid: null, action: 'not_exported', reason: 'no_asana_gid' });
+      report.push(classifyRemoteUnbound(state, task, snapshot));
       continue;
     }
     const remote = remoteByGid.get(task.asana.gid);
@@ -794,6 +1071,11 @@ function push(state, snapshot, apply, tasks, resolution) {
     let remoteGid = task.asana.gid;
     if (!remoteGid && apply) remoteGid = bindings.get(task.id) ?? null;
     if (!remoteGid) {
+      const discovery = classifyRemoteUnbound(state, task, snapshot);
+      if (discovery.action !== 'not_exported') {
+        report.push(discovery);
+        continue;
+      }
       report.push({ id: task.id, asana_gid: null, action: 'create_required', reason: 'not_exported' });
       mcpOperations.push(plannedMcpCreate(state, task));
       if (!apply) {
@@ -859,13 +1141,20 @@ function push(state, snapshot, apply, tasks, resolution) {
   return { report, changed, mcp_operations: mcpOperations, receipt_tasks: receiptTasks };
 }
 
-async function writePlanReceipt(receiptPath, statePath, options, receiptTasks) {
+async function writePlanReceipt(receiptPath, statePath, state, options, receiptTasks) {
   const receipt = {
     schema_version: 'asana-task-sync-plan-receipt/v1',
     operation: options.operation,
     state_path: statePath,
     task_selector: options.taskSelector,
     resolution: options.resolution,
+    ...(options.operation === 'bind' ? {
+      remote_gid: options.remoteGid,
+      target_project: {
+        gid: state.asana_target.project_gid,
+        name: state.asana_target.project,
+      },
+    } : {}),
     tasks: receiptTasks,
   };
   await writeFile(receiptPath, `${JSON.stringify(receipt, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
@@ -879,12 +1168,14 @@ async function readPlanReceipt(receiptPath, statePath, options, tasks, loadedRec
     || receipt.state_path !== statePath
     || receipt.task_selector !== options.taskSelector
     || receipt.resolution !== options.resolution
+    || (options.operation === 'bind' && receipt.remote_gid !== options.remoteGid)
     || !Array.isArray(receipt.tasks)) {
     throw new Error('Plan receipt does not match this operation, state file, or selected task scope. Run a new --plan.');
   }
-  if (options.operation === 'pull'
+  if (['pull', 'bind'].includes(options.operation)
     && receipt.tasks.some((task) => !Object.hasOwn(task, 'planned_json_task'))) {
-    throw new Error('Pull plan receipt lacks its JSON task guard. Run a new --plan.');
+    const operationLabel = options.operation === 'pull' ? 'Pull' : 'Bind';
+    throw new Error(`${operationLabel} plan receipt lacks its JSON task guard. Run a new --plan.`);
   }
   if (options.operation === 'pull') {
     if (new Set(receipt.tasks.map((task) => task.id)).size !== receipt.tasks.length) {
@@ -906,6 +1197,20 @@ async function readPlanReceipt(receiptPath, statePath, options, tasks, loadedRec
     }
     return receipt;
   }
+  if (options.operation === 'bind') {
+    if (receipt.tasks.length !== 1
+      || receipt.tasks[0].id !== options.taskSelector
+      || receipt.tasks[0].asana_gid !== options.remoteGid
+      || typeof receipt.target_project?.gid !== 'string'
+      || typeof receipt.target_project?.name !== 'string'
+      || !Array.isArray(receipt.tasks[0].planned_gid_owners)
+      || stableJson(receipt.tasks[0].planned_remote_scope) !== stableJson({ kind: 'project' })
+      || stableJson(receipt.tasks[0].planned_matching_remote_gids) !== stableJson([options.remoteGid])
+      || !receipt.tasks[0].observed_identity) {
+      throw new Error('Bind plan receipt does not match the selected local task and remote GID. Run a new --plan.');
+    }
+    return receipt;
+  }
   const receiptIds = new Set(receipt.tasks.map((task) => task.id));
   const eligibleTasks = tasks;
   const expectedIds = new Set(eligibleTasks.map((task) => task.id));
@@ -920,6 +1225,73 @@ function planReceiptDiff(state, snapshot, options, tasks, receipt) {
   const receiptById = new Map(receipt.tasks.map((task) => [task.id, task]));
   const remoteByGid = new Map(snapshot.remotes.map((remote) => [remote.gid, remote]));
   const diff = [];
+  if (options.operation === 'bind') {
+    const [planned] = receipt.tasks;
+    const currentProject = {
+      gid: state.asana_target.project_gid,
+      name: state.asana_target.project,
+    };
+    diff.push(...projectionDiff(
+      receipt.target_project, currentProject, 'planned_configuration', 'current_configuration',
+    ).map((entry) => ({ id: planned.id, source: 'configuration', ...entry })));
+    const task = state.tasks.find((candidate) => candidate.id === planned.id);
+    if (!task) {
+      return [{
+        id: planned.id,
+        source: 'json',
+        field: 'task_presence',
+        planned_json: 'present',
+        current_json: 'missing',
+      }];
+    }
+    diff.push(...jsonTaskDiff(planned.planned_json_task, task)
+      .map((entry) => ({ id: planned.id, source: 'json', ...entry })));
+    if (!isFullProjectSnapshot(snapshot)) {
+      diff.push({
+        id: planned.id,
+        source: 'asana',
+        field: 'snapshot_scope',
+        planned_asana: planned.planned_remote_scope,
+        current_asana: snapshot.scope,
+      });
+    }
+    const currentOwners = gidOwners(state, options.remoteGid);
+    if (stableJson(planned.planned_gid_owners) !== stableJson(currentOwners)) {
+      diff.push({
+        id: planned.id,
+        source: 'json',
+        field: 'asana_gid_owners',
+        planned_json: planned.planned_gid_owners,
+        current_json: currentOwners,
+      });
+    }
+    const currentMatchingGids = matchingRemoteGids(state, task, snapshot);
+    if (stableJson(planned.planned_matching_remote_gids) !== stableJson(currentMatchingGids)) {
+      diff.push({
+        id: planned.id,
+        source: 'asana',
+        field: 'controlled_identity_matching_gids',
+        planned_asana: planned.planned_matching_remote_gids,
+        current_asana: currentMatchingGids,
+      });
+    }
+    const remote = remoteByGid.get(options.remoteGid);
+    if (!remote) {
+      diff.push({
+        id: planned.id,
+        source: 'asana',
+        field: 'task_presence',
+        planned_asana: 'present',
+        current_asana: 'missing',
+      });
+      return diff;
+    }
+    const currentIdentity = controlledBindIdentity(state, task, remote).actual;
+    diff.push(...projectionDiff(
+      planned.observed_identity, currentIdentity, 'planned_asana', 'current_asana',
+    ).map((entry) => ({ id: planned.id, source: 'asana', ...entry })));
+    return diff;
+  }
   if (options.operation === 'pull') {
     const accountedTasks = new Set();
     for (const planned of receipt.tasks) {
@@ -1005,8 +1377,8 @@ function parseArguments(argv) {
     const validateArgs = mode ? [mode, ...rest] : rest;
     return parseOptions({ operation, apply: false, mode: 'validate' }, validateArgs);
   }
-  if (!['pull', 'push', 'import'].includes(operation) || !['--plan', '--apply'].includes(mode)) {
-    throw new Error('Usage: asana-task-sync <import|pull|push> <--plan|--apply> [options]');
+  if (!['bind', 'pull', 'push', 'import'].includes(operation) || !['--plan', '--apply'].includes(mode)) {
+    throw new Error('Usage: asana-task-sync <bind|import|pull|push> <--plan|--apply> [options]');
   }
   return parseOptions({ operation, apply: mode === '--apply', mode: mode.slice(2) }, rest);
 }
@@ -1014,13 +1386,14 @@ function parseArguments(argv) {
 function parseOptions(options, args) {
   Object.assign(options, {
     statePath: null, envPath: null, snapshotPath: null, go: null,
-    name: null, outputDir: null, sectionName: null, taskSelector: null, planReceiptPath: null, resolution: null,
+    name: null, outputDir: null, sectionName: null, taskSelector: null, planReceiptPath: null,
+    resolution: null, remoteGid: null,
   });
   for (let index = 0; index < args.length; index += 1) {
     const flag = args[index];
     const value = args[index + 1];
-    if (!['--go', '--state', '--env', '--snapshot', '--name', '--output-dir', '--section', '--task', '--plan-receipt', '--resolve'].includes(flag) || !value) {
-      throw new Error('Invalid option. Use --go, --state, --env, --snapshot, --name, --output-dir, --section, --task, --plan-receipt, or --resolve with a value.');
+    if (!['--go', '--state', '--env', '--snapshot', '--name', '--output-dir', '--section', '--task', '--gid', '--plan-receipt', '--resolve'].includes(flag) || !value) {
+      throw new Error('Invalid option. Use --go, --state, --env, --snapshot, --name, --output-dir, --section, --task, --gid, --plan-receipt, or --resolve with a value.');
     }
     index += 1;
     if (flag === '--go') options.go = value;
@@ -1031,6 +1404,7 @@ function parseOptions(options, args) {
     if (flag === '--output-dir') options.outputDir = resolve(value);
     if (flag === '--section') options.sectionName = value;
     if (flag === '--task') options.taskSelector = value;
+    if (flag === '--gid') options.remoteGid = value;
     if (flag === '--plan-receipt') options.planReceiptPath = resolve(value);
     if (flag === '--resolve') options.resolution = value;
   }
@@ -1042,7 +1416,7 @@ function parseOptions(options, args) {
   }
   if (options.operation === 'validate') {
     if (options.name || options.outputDir || options.sectionName || options.snapshotPath
-      || options.taskSelector || options.planReceiptPath || options.resolution) {
+      || options.taskSelector || options.remoteGid || options.planReceiptPath || options.resolution) {
       throw new Error('validate accepts only --state and --env.');
     }
     return options;
@@ -1055,15 +1429,25 @@ function parseOptions(options, args) {
       || options.name.endsWith('_TASK_CONTROL')) {
       throw new Error('--name must be a safe technical name without the _TASK_CONTROL suffix.');
     }
-    if (options.statePath || options.taskSelector || options.planReceiptPath || options.resolution) {
-      throw new Error('import derives its state path from --name and --output-dir; it does not accept --state, --task, --plan-receipt, or --resolve.');
+    if (options.statePath || options.taskSelector || options.remoteGid || options.planReceiptPath || options.resolution) {
+      throw new Error('import derives its state path from --name and --output-dir; it does not accept --state, --task, --gid, --plan-receipt, or --resolve.');
     }
   } else if (!options.snapshotPath) {
     throw new Error(`${options.operation} requires --snapshot PATH created from the configured Asana MCP.`);
   } else if (options.name || options.outputDir || options.sectionName) {
     throw new Error('--name, --output-dir, and --section are valid only for import.');
   }
-  if (options.apply && ['pull', 'push'].includes(options.operation) && !options.planReceiptPath) {
+  if (options.operation === 'bind') {
+    if (!options.taskSelector || !options.remoteGid) {
+      throw new Error('bind requires --task STABLE_LOCAL_ID and --gid ASANA_GID.');
+    }
+    if (options.resolution) {
+      throw new Error('--resolve is not supported for bind.');
+    }
+  } else if (options.remoteGid) {
+    throw new Error('--gid is valid only for bind.');
+  }
+  if (options.apply && ['bind', 'pull', 'push'].includes(options.operation) && !options.planReceiptPath) {
     throw new Error(`${options.operation} --apply requires --plan-receipt PATH created by its preceding --plan.`);
   }
   if (options.resolution !== null) {
@@ -1188,7 +1572,7 @@ function assertInstancePair(statePath, envPath) {
 export async function main(argv = process.argv.slice(2), baseEnvironment = process.env) {
   const options = parseArguments(argv);
   if (options.help) {
-    process.stdout.write(`Użycie:\n  asana-task-sync validate [--state PATH] --env NAME_TASK_CONTROL.env\n  asana-task-sync import <--plan|--apply> --name NAME --output-dir PATH --section SECTION_NAME --snapshot SNAPSHOT.json [--go GO] --env NAME_TASK_CONTROL.env\n  asana-task-sync <pull|push> --plan --snapshot SNAPSHOT.json [--task LOCAL_ID_OR_ASANA_GID[,LOCAL_ID_OR_ASANA_GID...]] [--plan-receipt PLAN.json] [--resolve json] [--state PATH] --env NAME_TASK_CONTROL.env\n  asana-task-sync <pull|push> --apply --go GO --snapshot SNAPSHOT.json --plan-receipt PLAN.json [--task LOCAL_ID_OR_ASANA_GID[,LOCAL_ID_OR_ASANA_GID...]] [--resolve json] [--state PATH] --env NAME_TASK_CONTROL.env\n\nTryby:\n  validate       waliduje bazę JSON bez zrzutu Asany\n  import --plan  wykrywa zadania istniejące w zrzucie MCP bez zapisu\n  import --apply tworzy lub uzupełnia NAME_TASK_CONTROL.json po GO\n  pull --plan    klasyfikuje różnice z MCP snapshot bez zapisu; opcjonalnie zapisuje receipt\n  pull --apply   porównuje świeży snapshot z receipt; przy różnicy zwraca diff i nie zapisuje JSON-a\n  push --plan    generuje manifest operacji MCP wymaganych w Asanie; opcjonalnie zapisuje receipt\n  push --apply   potwierdza w JSON-ie operacje już wykonane przez MCP i sprawdza niezmienność lokalnego planu\n\nKonfiguracja:\n  NAME jest prefiksem bez _TASK_CONTROL, np. PROJECT albo PROJECT_X.\n  --env jest wymagany i musi wskazywać sąsiedni plik NAME_TASK_CONTROL.env poza katalogiem narzędzia.\n  --task ogranicza pull lub push do jednego lub kilku stabilnych lokalnych ID albo GID Asany, rozdzielonych przecinkiem.\n  --plan-receipt jest opcjonalnym artefaktem --plan i wymaganym wejściem późniejszego pull/push --apply.\n  --resolve json jest jawną decyzją operatora, że JSON wygrywa wcześniej wykryty konflikt kontrolowanej projekcji.\n  --section jest wymaganą, jawną nazwą źródłowej tablicy Asany dla importu.\n  --snapshot pochodzi z MCP Asany skonfigurowanego dla bieżącego agenta i leży poza katalogiem narzędzia.\n`);
+    process.stdout.write(`Użycie:\n  asana-task-sync validate [--state PATH] --env NAME_TASK_CONTROL.env\n  asana-task-sync import <--plan|--apply> --name NAME --output-dir PATH --section SECTION_NAME --snapshot SNAPSHOT.json [--go GO] --env NAME_TASK_CONTROL.env\n  asana-task-sync bind --plan --task STABLE_LOCAL_ID --gid ASANA_GID --snapshot SNAPSHOT.json [--plan-receipt PLAN.json] [--state PATH] --env NAME_TASK_CONTROL.env\n  asana-task-sync bind --apply --go GO --task STABLE_LOCAL_ID --gid ASANA_GID --snapshot SNAPSHOT.json --plan-receipt PLAN.json [--state PATH] --env NAME_TASK_CONTROL.env\n  asana-task-sync <pull|push> --plan --snapshot SNAPSHOT.json [--task LOCAL_ID_OR_ASANA_GID[,LOCAL_ID_OR_ASANA_GID...]] [--plan-receipt PLAN.json] [--resolve json] [--state PATH] --env NAME_TASK_CONTROL.env\n  asana-task-sync <pull|push> --apply --go GO --snapshot SNAPSHOT.json --plan-receipt PLAN.json [--task LOCAL_ID_OR_ASANA_GID[,LOCAL_ID_OR_ASANA_GID...]] [--resolve json] [--state PATH] --env NAME_TASK_CONTROL.env\n\nTryby:\n  validate       waliduje bazę JSON bez zrzutu Asany\n  import --plan  wykrywa zadania istniejące w zrzucie MCP bez zapisu\n  import --apply tworzy lub uzupełnia NAME_TASK_CONTROL.json po GO\n  bind --plan    waliduje jawne wiązanie stabilnego lokalnego ID z istniejącym GID bez zapisu\n  bind --apply   ustawia wyłącznie asana.gid po GO i weryfikacji świeżego receipt-u\n  pull --plan    klasyfikuje różnice z MCP snapshot bez zapisu; opcjonalnie zapisuje receipt\n  pull --apply   porównuje świeży snapshot z receipt; przy różnicy zwraca diff i nie zapisuje JSON-a\n  push --plan    generuje manifest operacji MCP wymaganych w Asanie; opcjonalnie zapisuje receipt\n  push --apply   potwierdza w JSON-ie operacje już wykonane przez MCP i sprawdza niezmienność lokalnego planu\n\nKonfiguracja:\n  NAME jest prefiksem bez _TASK_CONTROL, np. PROJECT albo PROJECT_X.\n  --env jest wymagany i musi wskazywać sąsiedni plik NAME_TASK_CONTROL.env poza katalogiem narzędzia.\n  bind wymaga jednego stabilnego lokalnego ID w --task i istniejącego GID Asany w --gid; nie dopasowuje po tytule.\n  --task ogranicza pull lub push do jednego lub kilku stabilnych lokalnych ID albo GID Asany, rozdzielonych przecinkiem.\n  --plan-receipt jest opcjonalnym artefaktem --plan i wymaganym wejściem późniejszego bind/pull/push --apply.\n  --resolve json jest jawną decyzją operatora, że JSON wygrywa wcześniej wykryty konflikt kontrolowanej projekcji.\n  --section jest wymaganą, jawną nazwą źródłowej tablicy Asany dla importu.\n  --snapshot pochodzi z MCP Asany skonfigurowanego dla bieżącego agenta i leży poza katalogiem narzędzia.\n`);
     return { help: true };
   }
   assertOutsideToolDirectory(options.envPath, 'Instance environment');
@@ -1225,18 +1609,20 @@ export async function main(argv = process.argv.slice(2), baseEnvironment = proce
   configureState(state, environment);
   const snapshot = await readMcpSnapshot(options.snapshotPath, state);
   let receipt = null;
-  if (options.apply && ['pull', 'push'].includes(options.operation)) {
+  if (options.apply && ['bind', 'pull', 'push'].includes(options.operation)) {
     receipt = JSON.parse(await readFile(options.planReceiptPath, 'utf8'));
   }
   const tasks = options.operation === 'import'
     ? null
-    : options.operation === 'pull' && options.apply && Array.isArray(receipt?.tasks)
-      ? receipt.tasks.flatMap((planned) => {
-        const resolved = resolvePlannedPullTask(state, planned);
-        return resolved.task ? [resolved.task] : [];
-      })
-      : selectTasks(state, options.taskSelector);
-  if (options.apply && ['pull', 'push'].includes(options.operation)) {
+    : options.operation === 'bind'
+      ? [selectBindTask(state, options.taskSelector)]
+      : options.operation === 'pull' && options.apply && Array.isArray(receipt?.tasks)
+        ? receipt.tasks.flatMap((planned) => {
+          const resolved = resolvePlannedPullTask(state, planned);
+          return resolved.task ? [resolved.task] : [];
+        })
+        : selectTasks(state, options.taskSelector);
+  if (options.apply && ['bind', 'pull', 'push'].includes(options.operation)) {
     receipt = await readPlanReceipt(options.planReceiptPath, statePath, options, tasks, receipt);
     const decisionRequiredDiff = planReceiptDiff(state, snapshot, options, tasks, receipt);
     if (decisionRequiredDiff.length > 0) {
@@ -1253,11 +1639,13 @@ export async function main(argv = process.argv.slice(2), baseEnvironment = proce
       return report;
     }
   }
-  const outcome = options.operation === 'pull'
-    ? await pull(state, snapshot, options.apply, tasks)
-    : options.operation === 'push'
-      ? await push(state, snapshot, options.apply, tasks, options.resolution)
-      : importTasks(state, snapshot, options.apply, options.sectionName);
+  const outcome = options.operation === 'bind'
+    ? bind(state, snapshot, options.apply, tasks[0], options.remoteGid)
+    : options.operation === 'pull'
+      ? await pull(state, snapshot, options.apply, tasks)
+      : options.operation === 'push'
+        ? await push(state, snapshot, options.apply, tasks, options.resolution)
+        : importTasks(state, snapshot, options.apply, options.sectionName);
   const shouldWriteState = options.apply
     && (outcome.changed || (options.operation === 'import' && !stateExisted));
   if (shouldWriteState) {
@@ -1277,8 +1665,11 @@ export async function main(argv = process.argv.slice(2), baseEnvironment = proce
   };
   if (outcome.import_scope) report.import_scope = outcome.import_scope;
   if (outcome.mcp_operations) report.mcp_operations = outcome.mcp_operations;
-  if (!options.apply && options.planReceiptPath) {
-    await writePlanReceipt(options.planReceiptPath, statePath, options, outcome.receipt_tasks ?? []);
+  if (!options.apply && options.planReceiptPath
+    && (options.operation !== 'bind' || outcome.receipt_tasks?.length === 1)) {
+    await writePlanReceipt(
+      options.planReceiptPath, statePath, state, options, outcome.receipt_tasks ?? [],
+    );
     report.plan_receipt_path = options.planReceiptPath;
   }
   process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
