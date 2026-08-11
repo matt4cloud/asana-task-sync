@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import test from 'node:test';
@@ -1803,6 +1803,225 @@ test('legacy bound databases without a rendered Plan ID remain valid for validat
     const schemaPath = fileURLToPath(new URL('../task-control.schema.json', import.meta.url));
     const schema = JSON.parse(await readFile(schemaPath, 'utf8'));
     assert.equal(schema.properties.rendering.properties.managed_fields.allOf, undefined);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('legacy database-wide reconciliation fields are inert while conflicts and task classifications remain visible', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'asana-task-sync-legacy-reconciliation-'));
+  const statePath = join(directory, 'TASK_CONTROL.json');
+  const envPath = join(directory, 'TASK_CONTROL.env');
+  const controlState = attachRuntime(state());
+  const controlledTask = task();
+  const remote = remoteFromTask(controlState, controlledTask);
+  establishBaseline(controlState, controlledTask, remote);
+  const notExportedTask = task({
+    id: 'task-2',
+    title: 'Keep the local-only task visible',
+    asana: {
+      ...task().asana,
+      gid: null,
+      last_synced_plan_sha256: null,
+      last_synced_projection_sha256: null,
+      sync_status: 'not_exported',
+    },
+  });
+  const legacySynchronization = {
+    last_reconciled_at: null,
+    last_reconciled_by: 'manual-bootstrap',
+    status: 'stale_global_claim',
+    conflicts: [{ id: 'task-2', reason: 'operator_review_required' }],
+  };
+  controlState.synchronization = JSON.parse(JSON.stringify(legacySynchronization));
+  controlState.tasks = [controlledTask, notExportedTask];
+  const before = `${JSON.stringify(controlState, null, 2)}\n`;
+  await writeFile(statePath, before, 'utf8');
+  const snapshotPath = await writeSnapshot(directory, projectSnapshot([remote]));
+
+  try {
+    const validation = await main([
+      'validate', '--env', envPath,
+    ], environment('TASK_CONTROL.json'));
+    assert.equal(validation.tasks, 2);
+
+    const pullPlan = await main([
+      'pull', '--plan', '--snapshot', snapshotPath, '--env', envPath,
+    ], environment('TASK_CONTROL.json'));
+    assert.deepEqual(pullPlan.tasks.map(({ id, action }) => ({ id, action })), [
+      { id: 'task-1', action: 'synchronized' },
+      { id: 'task-2', action: 'not_exported' },
+    ]);
+
+    const pushPlan = await main([
+      'push', '--plan', '--snapshot', snapshotPath, '--env', envPath,
+    ], environment('TASK_CONTROL.json'));
+    assert.deepEqual(pushPlan.tasks.map(({ id, action }) => ({ id, action })), [
+      { id: 'task-1', action: 'synchronized' },
+      { id: 'task-2', action: 'create_required' },
+    ]);
+    assert.equal(pushPlan.mcp_operations.filter(({ operation }) => operation === 'create_task').length, 1);
+    assert.equal(await readFile(statePath, 'utf8'), before);
+    assert.deepEqual(JSON.parse(before).synchronization, legacySynchronization);
+
+    const changedRemote = JSON.parse(JSON.stringify(remote));
+    changedRemote.completed = true;
+    changedRemote.modified_at = '2026-08-11T07:00:00.000Z';
+    changedRemote.memberships[0].section = { gid: 'section-done', name: 'DONE' };
+    await writeFile(snapshotPath, `${JSON.stringify(projectSnapshot([changedRemote]), null, 2)}\n`, 'utf8');
+    const receiptPath = join(directory, 'legacy-pull-plan-receipt.json');
+    const changedPlan = await main([
+      'pull', '--plan', '--snapshot', snapshotPath, '--plan-receipt', receiptPath,
+      '--env', envPath,
+    ], environment('TASK_CONTROL.json'));
+    assert.equal(changedPlan.tasks[0].action, 'pull_required');
+    assert.equal(changedPlan.tasks[1].action, 'not_exported');
+    const changedApply = await main([
+      'pull', '--apply', '--go', 'GO_PULL_LEGACY', '--snapshot', snapshotPath,
+      '--plan-receipt', receiptPath, '--env', envPath,
+    ], environment('TASK_CONTROL.json'));
+    assert.equal(changedApply.changed_json, true);
+    const savedLegacyState = JSON.parse(await readFile(statePath, 'utf8'));
+    assert.deepEqual(savedLegacyState.synchronization, legacySynchronization);
+    assert.equal(savedLegacyState.tasks[0].asana.completed, true);
+    assert.equal(savedLegacyState.tasks[0].asana.section_name, 'DONE');
+    assert.equal(savedLegacyState.tasks[1].asana.sync_status, 'not_exported');
+
+    const schemaPath = fileURLToPath(new URL('../task-control.schema.json', import.meta.url));
+    const schema = JSON.parse(await readFile(schemaPath, 'utf8'));
+    assert.deepEqual(Object.keys(schema.properties.synchronization.properties), ['conflicts']);
+    assert.equal(schema.properties.synchronization.properties.conflicts.type, 'array');
+    assert.equal(schema.properties.synchronization.additionalProperties, true);
+
+    const examplePath = fileURLToPath(new URL('../examples/task-control.example.json', import.meta.url));
+    const example = JSON.parse(await readFile(examplePath, 'utf8'));
+    assert.deepEqual(example.synchronization, { conflicts: [] });
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+
+  const bindFixture = await unboundFixture('asana-task-sync-legacy-reconciliation-bind-');
+  try {
+    const legacyBindState = JSON.parse(await readFile(bindFixture.statePath, 'utf8'));
+    legacyBindState.synchronization = JSON.parse(JSON.stringify(legacySynchronization));
+    const beforeBind = `${JSON.stringify(legacyBindState, null, 2)}\n`;
+    await writeFile(bindFixture.statePath, beforeBind, 'utf8');
+
+    const bindPlan = await main([
+      'bind', '--plan', '--task', 'task-1', '--gid', 'asana-existing',
+      '--snapshot', bindFixture.snapshotPath, '--plan-receipt', bindFixture.planReceiptPath,
+      '--env', bindFixture.envPath,
+    ], environment('TASK_CONTROL.json'));
+    assert.equal(bindPlan.tasks[0].action, 'bind_required');
+    assert.equal(await readFile(bindFixture.statePath, 'utf8'), beforeBind);
+    assert.deepEqual(JSON.parse(beforeBind).synchronization, legacySynchronization);
+  } finally {
+    await rm(bindFixture.directory, { recursive: true, force: true });
+  }
+});
+
+test('two host copies reconcile independently only from fresh Asana snapshots', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'asana-task-sync-two-hosts-'));
+  const hostA = join(directory, 'host-a');
+  const hostB = join(directory, 'host-b');
+  const stateAPath = join(hostA, 'TASK_CONTROL.json');
+  const stateBPath = join(hostB, 'TASK_CONTROL.json');
+  const envAPath = join(hostA, 'TASK_CONTROL.env');
+  const envBPath = join(hostB, 'TASK_CONTROL.env');
+  const controlState = attachRuntime(state());
+  const controlledTask = task();
+  const initialRemote = remoteFromTask(controlState, controlledTask);
+  establishBaseline(controlState, controlledTask, initialRemote);
+  controlState.tasks = [controlledTask];
+  const initialJson = `${JSON.stringify(controlState, null, 2)}\n`;
+  await mkdir(hostA, { recursive: true });
+  await mkdir(hostB, { recursive: true });
+  await writeFile(stateAPath, initialJson, 'utf8');
+  await writeFile(stateBPath, initialJson, 'utf8');
+
+  const remoteAfterA = JSON.parse(JSON.stringify(initialRemote));
+  remoteAfterA.completed = true;
+  remoteAfterA.due_on = '2026-08-11';
+  remoteAfterA.modified_at = '2026-08-11T08:00:00.000Z';
+  remoteAfterA.memberships[0].section = { gid: 'section-done', name: 'DONE' };
+
+  try {
+    const snapshotAPath = await writeSnapshot(hostA, snapshot([remoteAfterA]));
+    const receiptAPath = join(hostA, 'pull-plan-receipt.json');
+    const planA = await main([
+      'pull', '--plan', '--snapshot', snapshotAPath, '--plan-receipt', receiptAPath,
+      '--env', envAPath,
+    ], environment('TASK_CONTROL.json'));
+    assert.equal(planA.tasks[0].action, 'pull_required');
+    const applyA = await main([
+      'pull', '--apply', '--go', 'GO_PULL_A', '--snapshot', snapshotAPath,
+      '--plan-receipt', receiptAPath, '--env', envAPath,
+    ], environment('TASK_CONTROL.json'));
+    assert.equal(applyA.changed_json, true);
+    const savedA = JSON.parse(await readFile(stateAPath, 'utf8'));
+    assert.equal(savedA.tasks[0].asana.completed, true);
+    assert.equal(savedA.tasks[0].asana.section_name, 'DONE');
+    assert.equal(Object.hasOwn(savedA, 'synchronization'), false);
+
+    assert.equal(await readFile(stateBPath, 'utf8'), initialJson);
+    const staleSnapshotBPath = await writeSnapshot(hostB, snapshot([initialRemote]));
+    const stalePlanB = await main([
+      'pull', '--plan', '--snapshot', staleSnapshotBPath, '--env', envBPath,
+    ], environment('TASK_CONTROL.json'));
+    assert.equal(stalePlanB.tasks[0].action, 'synchronized');
+    assert.equal(await readFile(stateBPath, 'utf8'), initialJson);
+
+    const foreignSnapshot = snapshot([remoteAfterA]);
+    foreignSnapshot.target = {
+      project: { gid: 'foreign-project', name: 'Foreign project' },
+      assignee: { ...target.assignee },
+    };
+    await writeFile(staleSnapshotBPath, `${JSON.stringify(foreignSnapshot, null, 2)}\n`, 'utf8');
+    await assert.rejects(
+      main([
+        'pull', '--plan', '--snapshot', staleSnapshotBPath, '--env', envBPath,
+      ], environment('TASK_CONTROL.json')),
+      /MCP snapshot project does not match the configured instance target/,
+    );
+    assert.equal(await readFile(stateBPath, 'utf8'), initialJson);
+
+    const freshSnapshotBPath = await writeSnapshot(hostB, snapshot([remoteAfterA]));
+    const receiptBPath = join(hostB, 'pull-plan-receipt.json');
+    const planB = await main([
+      'pull', '--plan', '--snapshot', freshSnapshotBPath, '--plan-receipt', receiptBPath,
+      '--env', envBPath,
+    ], environment('TASK_CONTROL.json'));
+    assert.equal(planB.tasks[0].action, 'pull_required');
+
+    const remoteAfterB = JSON.parse(JSON.stringify(remoteAfterA));
+    remoteAfterB.due_on = '2026-08-12';
+    remoteAfterB.modified_at = '2026-08-11T09:00:00.000Z';
+    await writeFile(freshSnapshotBPath, `${JSON.stringify(snapshot([remoteAfterB]), null, 2)}\n`, 'utf8');
+    const blockedB = await main([
+      'pull', '--apply', '--go', 'GO_PULL_B_STALE', '--snapshot', freshSnapshotBPath,
+      '--plan-receipt', receiptBPath, '--env', envBPath,
+    ], environment('TASK_CONTROL.json'));
+    assert.equal(blockedB.blocked, true);
+    assert.equal(blockedB.reason, 'state_changed_after_plan');
+    assert.equal(blockedB.decision_required_diff.some(({ field }) => field === 'due_on'), true);
+    assert.equal(await readFile(stateBPath, 'utf8'), initialJson);
+
+    const freshPlanB = await main([
+      'pull', '--plan', '--snapshot', freshSnapshotBPath, '--plan-receipt', receiptBPath,
+      '--env', envBPath,
+    ], environment('TASK_CONTROL.json'));
+    assert.equal(freshPlanB.tasks[0].action, 'pull_required');
+    const applyB = await main([
+      'pull', '--apply', '--go', 'GO_PULL_B', '--snapshot', freshSnapshotBPath,
+      '--plan-receipt', receiptBPath, '--env', envBPath,
+    ], environment('TASK_CONTROL.json'));
+    assert.equal(applyB.changed_json, true);
+    const savedB = JSON.parse(await readFile(stateBPath, 'utf8'));
+    assert.equal(savedB.tasks[0].asana.completed, true);
+    assert.equal(savedB.tasks[0].asana.section_name, 'DONE');
+    assert.equal(savedB.tasks[0].asana.due_on, '2026-08-12');
+    assert.equal(savedB.tasks[0].asana.last_seen_at, '2026-08-11T09:00:00.000Z');
+    assert.equal(Object.hasOwn(savedB, 'synchronization'), false);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

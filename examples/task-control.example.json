@@ -43,6 +43,9 @@
       }
     ]
   },
+  "synchronization": {
+    "conflicts": []
+  },
   "tasks": [
     {
       "id": "prepare-report",

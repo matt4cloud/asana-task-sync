@@ -40,6 +40,13 @@
       },
       "additionalProperties": true
     },
+    "synchronization": {
+      "type": "object",
+      "properties": {
+        "conflicts": { "type": "array" }
+      },
+      "additionalProperties": true
+    },
     "tasks": {
       "type": "array",
       "items": { "$ref": "#/$defs/task" }

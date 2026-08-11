@@ -332,6 +332,17 @@ as a neutral starting point. JSON owns the full plan fields and controlled
 Asana projection; Asana owns operational placement, completion, due date, and
 the operator-notes suffix.
 
+Each host copy has its own synchronization baseline. Per-task `sync_status`,
+hashes, and `last_seen_at` describe only what that local JSON copy last
+observed. A fresh Asana snapshot and the matching plan receipt reconcile that
+copy; no database-wide timestamp, host identity, or status can prove that
+Asana, remote mapping, or another host copy is current.
+
+The optional `synchronization.conflicts` array remains host-owned conflict
+metadata. Older databases may also contain legacy database-wide reconciliation
+fields. The tool accepts and preserves those extra fields for compatibility,
+but does not create, update, or use them for task classification or decisions.
+
 For an informal checklist, the agent first models only facts supplied by the
 operator or host documentation, assigns stable local IDs, validates the JSON,
 and then follows the push workflow. It must not invent requirements, dates,
