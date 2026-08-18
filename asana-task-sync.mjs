@@ -14,6 +14,140 @@ import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const TOOL_DIRECTORY = resolve(dirname(fileURLToPath(import.meta.url)));
+export const SNAPSHOT_MAX_AGE_SECONDS = 300;
+export const SNAPSHOT_MAX_FUTURE_SKEW_SECONDS = 60;
+
+function snapshotTimeError(capturedAt, problem, allowedLimit) {
+  return new Error(
+    `Invalid MCP snapshot captured_at ${JSON.stringify(capturedAt)}: ${problem}. `
+    + `Allowed limit: ${allowedLimit}. Fetch a new snapshot from Asana and retry.`,
+  );
+}
+
+function normalizedFraction(fraction) {
+  return fraction.replace(/0+$/, '');
+}
+
+function compareSnapshotTimes(left, right) {
+  if (left.epoch_seconds < right.epoch_seconds) return -1;
+  if (left.epoch_seconds > right.epoch_seconds) return 1;
+  const length = Math.max(left.fraction.length, right.fraction.length);
+  const leftFraction = left.fraction.padEnd(length, '0');
+  const rightFraction = right.fraction.padEnd(length, '0');
+  if (leftFraction < rightFraction) return -1;
+  if (leftFraction > rightFraction) return 1;
+  return 0;
+}
+
+function timeFromEpochMilliseconds(epochMilliseconds) {
+  if (!Number.isSafeInteger(epochMilliseconds)) {
+    throw new Error('The process clock must provide a finite integer millisecond epoch.');
+  }
+  const epochSeconds = Math.floor(epochMilliseconds / 1000);
+  const milliseconds = epochMilliseconds - epochSeconds * 1000;
+  return {
+    epoch_seconds: BigInt(epochSeconds),
+    fraction: String(milliseconds).padStart(3, '0').replace(/0+$/, ''),
+  };
+}
+
+function parseSnapshotDateTime(capturedAt) {
+  if (typeof capturedAt !== 'string' || capturedAt === '') {
+    throw snapshotTimeError(
+      capturedAt,
+      'captured_at must be a non-empty RFC 3339 date-time with an explicit timezone',
+      `${SNAPSHOT_MAX_AGE_SECONDS} seconds old and ${SNAPSHOT_MAX_FUTURE_SKEW_SECONDS} seconds in the future`,
+    );
+  }
+  const match = /^(\d{4})-(\d{2})-(\d{2})[Tt](\d{2}):(\d{2}):(\d{2})(?:\.(\d+))?([Zz]|[+-]\d{2}:\d{2})$/.exec(capturedAt);
+  if (!match) {
+    throw snapshotTimeError(
+      capturedAt,
+      'captured_at must be an unambiguous RFC 3339 date-time with an explicit timezone',
+      `${SNAPSHOT_MAX_AGE_SECONDS} seconds old and ${SNAPSHOT_MAX_FUTURE_SKEW_SECONDS} seconds in the future`,
+    );
+  }
+  const [, yearText, monthText, dayText, hourText, minuteText, secondText, fraction = '', zone] = match;
+  const year = Number(yearText);
+  const month = Number(monthText);
+  const day = Number(dayText);
+  const hour = Number(hourText);
+  const minute = Number(minuteText);
+  const second = Number(secondText);
+  const leapYear = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  const daysInMonth = [31, leapYear ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month - 1];
+  if (month < 1 || month > 12 || day < 1 || day > daysInMonth
+    || hour > 23 || minute > 59 || second > 59) {
+    throw snapshotTimeError(
+      capturedAt,
+      'captured_at is not a valid calendar date-time',
+      `${SNAPSHOT_MAX_AGE_SECONDS} seconds old and ${SNAPSHOT_MAX_FUTURE_SKEW_SECONDS} seconds in the future`,
+    );
+  }
+  let offsetMinutes = 0;
+  if (!/^[Zz]$/.test(zone)) {
+    if (zone === '-00:00') {
+      throw snapshotTimeError(
+        capturedAt,
+        'captured_at uses -00:00, which declares an unknown local timezone offset and cannot identify an unambiguous instant',
+        `${SNAPSHOT_MAX_AGE_SECONDS} seconds old and ${SNAPSHOT_MAX_FUTURE_SKEW_SECONDS} seconds in the future`,
+      );
+    }
+    const offsetHour = Number(zone.slice(1, 3));
+    const offsetMinute = Number(zone.slice(4, 6));
+    if (offsetHour > 23 || offsetMinute > 59) {
+      throw snapshotTimeError(
+        capturedAt,
+        'captured_at contains an invalid timezone offset',
+        `${SNAPSHOT_MAX_AGE_SECONDS} seconds old and ${SNAPSHOT_MAX_FUTURE_SKEW_SECONDS} seconds in the future`,
+      );
+    }
+    offsetMinutes = (zone.startsWith('-') ? -1 : 1) * (offsetHour * 60 + offsetMinute);
+  }
+  const calendar = new Date(0);
+  calendar.setUTCFullYear(year, month - 1, day);
+  calendar.setUTCHours(hour, minute, second, 0);
+  const epochMilliseconds = calendar.getTime() - offsetMinutes * 60_000;
+  if (!Number.isSafeInteger(epochMilliseconds)) {
+    throw snapshotTimeError(
+      capturedAt,
+      'captured_at cannot be converted to a finite time',
+      `${SNAPSHOT_MAX_AGE_SECONDS} seconds old and ${SNAPSHOT_MAX_FUTURE_SKEW_SECONDS} seconds in the future`,
+    );
+  }
+  return {
+    epoch_seconds: BigInt(Math.floor(epochMilliseconds / 1000)),
+    fraction: normalizedFraction(fraction),
+  };
+}
+
+export function validateSnapshotCapturedAt(capturedAt, nowMilliseconds = Date.now()) {
+  const capturedAtTime = parseSnapshotDateTime(capturedAt);
+  const now = timeFromEpochMilliseconds(nowMilliseconds);
+  const oldestAllowed = {
+    epoch_seconds: now.epoch_seconds - BigInt(SNAPSHOT_MAX_AGE_SECONDS),
+    fraction: now.fraction,
+  };
+  if (compareSnapshotTimes(capturedAtTime, oldestAllowed) < 0) {
+    throw snapshotTimeError(
+      capturedAt,
+      'the snapshot is too old',
+      `${SNAPSHOT_MAX_AGE_SECONDS} seconds maximum age`,
+    );
+  }
+  const newestAllowed = {
+    epoch_seconds: now.epoch_seconds + BigInt(SNAPSHOT_MAX_FUTURE_SKEW_SECONDS),
+    fraction: now.fraction,
+  };
+  if (compareSnapshotTimes(capturedAtTime, newestAllowed) > 0) {
+    throw snapshotTimeError(
+      capturedAt,
+      'the snapshot time is too far in the future',
+      `${SNAPSHOT_MAX_FUTURE_SKEW_SECONDS} seconds maximum future clock skew`,
+    );
+  }
+  return capturedAtTime;
+}
 
 export function stableJson(value) {
   if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`;
@@ -496,6 +630,7 @@ function validateMcpSnapshot(snapshot, state) {
     || (snapshot.bindings !== undefined && !Array.isArray(snapshot.bindings))) {
     throw new Error('Unsupported MCP snapshot; expected asana-mcp-snapshot/v1.');
   }
+  const capturedAtTime = validateSnapshotCapturedAt(snapshot.captured_at);
   const project = snapshot.target?.project;
   if (project?.gid !== state.asana_target.project_gid || project?.name !== state.asana_target.project) {
     throw new Error('MCP snapshot project does not match the configured instance target.');
@@ -538,7 +673,14 @@ function validateMcpSnapshot(snapshot, state) {
   if (new Set(remotes.map((task) => task.gid)).size !== remotes.length) {
     throw new Error('MCP snapshot contains duplicate Asana task GIDs.');
   }
-  return { sections, remotes, bindings: snapshot.bindings ?? [], scope: snapshot.scope ?? null };
+  return {
+    sections,
+    remotes,
+    bindings: snapshot.bindings ?? [],
+    scope: snapshot.scope ?? null,
+    captured_at: snapshot.captured_at,
+    captured_at_time: capturedAtTime,
+  };
 }
 
 async function readMcpSnapshot(snapshotPath, state) {
@@ -1155,13 +1297,14 @@ function push(state, snapshot, apply, tasks, resolution) {
   return { report, changed, mcp_operations: mcpOperations, receipt_tasks: receiptTasks };
 }
 
-async function writePlanReceipt(receiptPath, statePath, state, options, receiptTasks) {
+async function writePlanReceipt(receiptPath, statePath, state, snapshot, options, receiptTasks) {
   const receipt = {
     schema_version: 'asana-task-sync-plan-receipt/v1',
     operation: options.operation,
     state_path: statePath,
     task_selector: options.taskSelector,
     resolution: options.resolution,
+    snapshot_captured_at: snapshot.captured_at,
     ...(options.operation === 'bind' ? {
       remote_gid: options.remoteGid,
       target_project: {
@@ -1185,6 +1328,20 @@ async function readPlanReceipt(receiptPath, statePath, options, tasks, loadedRec
     || (options.operation === 'bind' && receipt.remote_gid !== options.remoteGid)
     || !Array.isArray(receipt.tasks)) {
     throw new Error('Plan receipt does not match this operation, state file, or selected task scope. Run a new --plan.');
+  }
+  if (!Object.hasOwn(receipt, 'snapshot_captured_at')) {
+    throw new Error(
+      'Plan receipt lacks snapshot_captured_at and cannot prove snapshot freshness. '
+      + 'Run a new --plan with a fresh snapshot from Asana.',
+    );
+  }
+  try {
+    parseSnapshotDateTime(receipt.snapshot_captured_at);
+  } catch {
+    throw new Error(
+      `Plan receipt has invalid snapshot_captured_at ${JSON.stringify(receipt.snapshot_captured_at)} `
+      + 'and cannot prove snapshot freshness. Run a new --plan with a fresh snapshot from Asana.',
+    );
   }
   if (['pull', 'bind'].includes(options.operation)
     && receipt.tasks.some((task) => !Object.hasOwn(task, 'planned_json_task'))) {
@@ -1233,6 +1390,18 @@ async function readPlanReceipt(receiptPath, statePath, options, tasks, loadedRec
     throw new Error('Plan receipt task scope does not match the current selection. Run a new --plan.');
   }
   return receipt;
+}
+
+function assertApplySnapshotIsNewer(snapshot, receipt) {
+  const plannedTime = parseSnapshotDateTime(receipt.snapshot_captured_at);
+  if (compareSnapshotTimes(snapshot.captured_at_time, plannedTime) <= 0) {
+    throw new Error(
+      `Apply snapshot captured_at ${JSON.stringify(snapshot.captured_at)} must be strictly later than `
+      + `the plan receipt snapshot_captured_at ${JSON.stringify(receipt.snapshot_captured_at)}. `
+      + `The snapshot maximum age remains ${SNAPSHOT_MAX_AGE_SECONDS} seconds. `
+      + 'Fetch a new snapshot from Asana and retry apply with the same receipt while its other guards remain valid.',
+    );
+  }
 }
 
 function planReceiptDiff(state, snapshot, options, tasks, receipt) {
@@ -1586,6 +1755,7 @@ function assertInstancePair(statePath, envPath) {
 export async function main(argv = process.argv.slice(2), baseEnvironment = process.env) {
   const options = parseArguments(argv);
   if (options.help) {
+    process.stdout.write('Świeżość snapshotu:\n  captured_at musi być poprawnym date-time, nie starszym niż 300 s i nie dalszym niż 60 s w przyszłości.\n  bind/pull/push --apply wymagają snapshotu z captured_at ściśle późniejszym niż w receipcie planu.\n\n');
     process.stdout.write(`Użycie:\n  asana-task-sync validate [--state PATH] --env NAME_TASK_CONTROL.env\n  asana-task-sync import <--plan|--apply> --name NAME --output-dir PATH --section SECTION_NAME --snapshot SNAPSHOT.json [--go GO] --env NAME_TASK_CONTROL.env\n  asana-task-sync bind --plan --task STABLE_LOCAL_ID --gid ASANA_GID --snapshot SNAPSHOT.json [--plan-receipt PLAN.json] [--state PATH] --env NAME_TASK_CONTROL.env\n  asana-task-sync bind --apply --go GO --task STABLE_LOCAL_ID --gid ASANA_GID --snapshot SNAPSHOT.json --plan-receipt PLAN.json [--state PATH] --env NAME_TASK_CONTROL.env\n  asana-task-sync <pull|push> --plan --snapshot SNAPSHOT.json [--task LOCAL_ID_OR_ASANA_GID[,LOCAL_ID_OR_ASANA_GID...]] [--plan-receipt PLAN.json] [--resolve json] [--state PATH] --env NAME_TASK_CONTROL.env\n  asana-task-sync <pull|push> --apply --go GO --snapshot SNAPSHOT.json --plan-receipt PLAN.json [--task LOCAL_ID_OR_ASANA_GID[,LOCAL_ID_OR_ASANA_GID...]] [--resolve json] [--state PATH] --env NAME_TASK_CONTROL.env\n\nTryby:\n  validate       waliduje bazę JSON bez zrzutu Asany\n  import --plan  wykrywa zadania istniejące w zrzucie MCP bez zapisu\n  import --apply tworzy lub uzupełnia NAME_TASK_CONTROL.json po GO\n  bind --plan    waliduje jawne wiązanie stabilnego lokalnego ID z istniejącym GID bez zapisu\n  bind --apply   ustawia wyłącznie asana.gid po GO i weryfikacji świeżego receipt-u\n  pull --plan    klasyfikuje różnice z MCP snapshot bez zapisu; opcjonalnie zapisuje receipt\n  pull --apply   porównuje świeży snapshot z receipt; przy różnicy zwraca diff i nie zapisuje JSON-a\n  push --plan    generuje manifest operacji MCP wymaganych w Asanie; opcjonalnie zapisuje receipt\n  push --apply   potwierdza w JSON-ie operacje już wykonane przez MCP i sprawdza niezmienność lokalnego planu\n\nKonfiguracja:\n  NAME jest prefiksem bez _TASK_CONTROL, np. PROJECT albo PROJECT_X.\n  --env jest wymagany i musi wskazywać sąsiedni plik NAME_TASK_CONTROL.env poza katalogiem narzędzia.\n  bind wymaga jednego stabilnego lokalnego ID w --task i istniejącego GID Asany w --gid; nie dopasowuje po tytule.\n  --task ogranicza pull lub push do jednego lub kilku stabilnych lokalnych ID albo GID Asany, rozdzielonych przecinkiem.\n  --plan-receipt jest opcjonalnym artefaktem --plan i wymaganym wejściem późniejszego bind/pull/push --apply.\n  --resolve json jest jawną decyzją operatora, że JSON wygrywa wcześniej wykryty konflikt kontrolowanej projekcji.\n  --section jest wymaganą, jawną nazwą źródłowej tablicy Asany dla importu.\n  --snapshot pochodzi z MCP Asany skonfigurowanego dla bieżącego agenta i leży poza katalogiem narzędzia.\n`);
     return { help: true };
   }
@@ -1638,6 +1808,7 @@ export async function main(argv = process.argv.slice(2), baseEnvironment = proce
         : selectTasks(state, options.taskSelector);
   if (options.apply && ['bind', 'pull', 'push'].includes(options.operation)) {
     receipt = await readPlanReceipt(options.planReceiptPath, statePath, options, tasks, receipt);
+    assertApplySnapshotIsNewer(snapshot, receipt);
     const decisionRequiredDiff = planReceiptDiff(state, snapshot, options, tasks, receipt);
     if (decisionRequiredDiff.length > 0) {
       const report = {
@@ -1647,6 +1818,8 @@ export async function main(argv = process.argv.slice(2), baseEnvironment = proce
         changed_json: false,
         blocked: true,
         reason: 'state_changed_after_plan',
+        snapshot_captured_at: snapshot.captured_at,
+        snapshot_max_age_seconds: SNAPSHOT_MAX_AGE_SECONDS,
         decision_required_diff: decisionRequiredDiff,
       };
       process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
@@ -1675,6 +1848,8 @@ export async function main(argv = process.argv.slice(2), baseEnvironment = proce
     changed_json: shouldWriteState,
     state_created: shouldWriteState && !stateExisted,
     conflicts: conflicts.length,
+    snapshot_captured_at: snapshot.captured_at,
+    snapshot_max_age_seconds: SNAPSHOT_MAX_AGE_SECONDS,
     tasks: outcome.report,
   };
   if (outcome.import_scope) report.import_scope = outcome.import_scope;
@@ -1682,7 +1857,7 @@ export async function main(argv = process.argv.slice(2), baseEnvironment = proce
   if (!options.apply && options.planReceiptPath
     && (options.operation !== 'bind' || outcome.receipt_tasks?.length === 1)) {
     await writePlanReceipt(
-      options.planReceiptPath, statePath, state, options, outcome.receipt_tasks ?? [],
+      options.planReceiptPath, statePath, state, snapshot, options, outcome.receipt_tasks ?? [],
     );
     report.plan_receipt_path = options.planReceiptPath;
   }

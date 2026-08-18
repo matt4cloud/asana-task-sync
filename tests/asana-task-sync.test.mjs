@@ -8,13 +8,15 @@ import { fileURLToPath } from 'node:url';
 import {
   classifyKnownTask,
   desiredProjection,
-  main,
+  main as cliMain,
   parseDotEnv,
   planPayload,
   renderManagedNotes,
   renderNotes,
   sha256,
+  SNAPSHOT_MAX_AGE_SECONDS,
   stableJson,
+  validateSnapshotCapturedAt,
 } from '../asana-task-sync.mjs';
 
 const target = {
@@ -112,7 +114,7 @@ function snapshotTask(remote) {
 function snapshot(tasks, scope = { kind: 'tasks' }, bindings = []) {
   return {
     schema_version: 'asana-mcp-snapshot/v1',
-    captured_at: '2026-08-04T10:00:00.000Z',
+    captured_at: new Date().toISOString(),
     target,
     sections,
     scope,
@@ -141,7 +143,7 @@ function snapshotSubtask(remote) {
 function snapshotWithParent(tasks, scope = { kind: 'tasks' }, bindings = []) {
   return {
     schema_version: 'asana-mcp-snapshot/v1',
-    captured_at: '2026-08-04T10:00:00.000Z',
+    captured_at: new Date().toISOString(),
     target,
     sections,
     scope,
@@ -165,6 +167,37 @@ async function writeSnapshot(directory, snapshotValue) {
   const path = join(directory, 'asana-mcp-snapshot.json');
   await writeFile(path, `${JSON.stringify(snapshotValue, null, 2)}\n`, 'utf8');
   return path;
+}
+
+let freshApplySnapshotCounter = 0;
+
+async function main(argv, baseEnvironment) {
+  if (!argv.includes('--apply') || !['bind', 'pull', 'push'].includes(argv[0])) {
+    return cliMain(argv, baseEnvironment);
+  }
+  const snapshotFlag = argv.indexOf('--snapshot');
+  const receiptFlag = argv.indexOf('--plan-receipt');
+  if (snapshotFlag < 0 || receiptFlag < 0) return cliMain(argv, baseEnvironment);
+  const snapshotPath = argv[snapshotFlag + 1];
+  const receiptPath = argv[receiptFlag + 1];
+  let receipt;
+  try {
+    receipt = JSON.parse(await readFile(receiptPath, 'utf8'));
+  } catch {
+    return cliMain(argv, baseEnvironment);
+  }
+  if (typeof receipt.snapshot_captured_at !== 'string') {
+    return cliMain(argv, baseEnvironment);
+  }
+  const applySnapshot = JSON.parse(await readFile(snapshotPath, 'utf8'));
+  const plannedTime = Date.parse(receipt.snapshot_captured_at);
+  applySnapshot.captured_at = new Date(Math.max(Date.now(), plannedTime + 1)).toISOString();
+  freshApplySnapshotCounter += 1;
+  const freshPath = join(dirname(snapshotPath), `.fresh-apply-snapshot-${freshApplySnapshotCounter}.json`);
+  await writeFile(freshPath, `${JSON.stringify(applySnapshot, null, 2)}\n`, 'utf8');
+  const freshArgv = [...argv];
+  freshArgv[snapshotFlag + 1] = freshPath;
+  return cliMain(freshArgv, baseEnvironment);
 }
 
 function establishBaseline(controlState, controlledTask, remote) {
@@ -300,6 +333,432 @@ test('validate is local and does not require an MCP snapshot', async () => {
     const report = await main(['validate', '--env', envPath], environment('TASK_CONTROL.json'));
     assert.equal(report.operation, 'validate');
     assert.equal(report.tasks, 1);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('snapshot captured_at enforces deterministic age, format, and future-skew boundaries', () => {
+  const now = Date.parse('2026-08-12T10:00:00.000Z');
+  for (const accepted of [
+    '2026-08-12T09:55:01.000Z',
+    '2026-08-12T09:55:00.000Z',
+    '2026-08-12T10:00:59.000Z',
+    '2026-08-12T10:01:00.000Z',
+    '2026-08-12T12:00:00.000+02:00',
+  ]) {
+    assert.doesNotThrow(() => validateSnapshotCapturedAt(accepted, now));
+  }
+  assert.throws(
+    () => validateSnapshotCapturedAt('2026-08-12T09:54:59.999Z', now),
+    /captured_at.*too old.*300 seconds maximum age.*Fetch a new snapshot from Asana/,
+  );
+  assert.throws(
+    () => validateSnapshotCapturedAt('2026-08-12T10:01:00.001Z', now),
+    /captured_at.*too far in the future.*60 seconds maximum future clock skew.*Fetch a new snapshot from Asana/,
+  );
+  assert.throws(
+    () => validateSnapshotCapturedAt('2026-08-12T10:00:00-00:00', now),
+    /captured_at.*-00:00.*unknown local timezone offset.*unambiguous instant.*Fetch a new snapshot from Asana/,
+  );
+  for (const invalid of [
+    '', 'not-a-date', 'NaN', '2026-02-30T10:00:00Z',
+    '2026-08-12T10:00:00', '2026-08-12T10:00:00+24:00',
+  ]) {
+    assert.throws(
+      () => validateSnapshotCapturedAt(invalid, now),
+      /Invalid MCP snapshot captured_at.*Fetch a new snapshot from Asana/,
+    );
+  }
+  assert.equal(SNAPSHOT_MAX_AGE_SECONDS, 300);
+});
+
+test('arbitrary RFC 3339 fractions reject out-of-range snapshots before artifacts', async (t) => {
+  const now = Date.parse('2026-08-12T10:00:00.000Z');
+  t.mock.method(Date, 'now', () => now);
+  const directory = await mkdtemp(join(tmpdir(), 'asana-task-sync-exact-fraction-age-'));
+  const statePath = join(directory, 'TASK_CONTROL.json');
+  const envPath = join(directory, 'TASK_CONTROL.env');
+  const receiptPath = join(directory, 'plan-receipt.json');
+  const controlState = attachRuntime(state());
+  const controlledTask = task();
+  controlState.tasks = [controlledTask];
+  const remote = remoteFromTask(controlState, controlledTask);
+  const beforeState = `${JSON.stringify(controlState, null, 2)}\n`;
+  const beforeReceipt = 'existing receipt must remain untouched\n';
+  await writeFile(statePath, beforeState, 'utf8');
+  await writeFile(receiptPath, beforeReceipt, 'utf8');
+
+  try {
+    for (const [capturedAt, expectedError] of [
+      ['2026-08-12T09:54:59.9999999Z', /the snapshot is too old/],
+      ['2026-08-12T10:01:00.0000001Z', /too far in the future/],
+    ]) {
+      const invalidSnapshot = projectSnapshot([remote]);
+      invalidSnapshot.captured_at = capturedAt;
+      const snapshotPath = await writeSnapshot(directory, invalidSnapshot);
+      let report;
+      await assert.rejects(
+        async () => {
+          report = await cliMain([
+            'pull', '--plan', '--snapshot', snapshotPath,
+            '--plan-receipt', receiptPath, '--env', envPath,
+          ], environment('TASK_CONTROL.json'));
+        },
+        expectedError,
+      );
+      assert.equal(report, undefined);
+      assert.equal(await readFile(statePath, 'utf8'), beforeState);
+      assert.equal(await readFile(receiptPath, 'utf8'), beforeReceipt);
+    }
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('sub-millisecond apply timestamps retain strictly-later receipt ordering', async (t) => {
+  const now = Date.parse('2026-08-12T10:00:00.000Z');
+  t.mock.method(Date, 'now', () => now);
+  const directory = await mkdtemp(join(tmpdir(), 'asana-task-sync-exact-fraction-apply-'));
+  const statePath = join(directory, 'TASK_CONTROL.json');
+  const envPath = join(directory, 'TASK_CONTROL.env');
+  const receiptPath = join(directory, 'pull-plan-receipt.json');
+  const controlState = attachRuntime(state());
+  const controlledTask = task();
+  controlState.tasks = [controlledTask];
+  const remote = remoteFromTask(controlState, controlledTask);
+  await writeFile(statePath, `${JSON.stringify(controlState, null, 2)}\n`, 'utf8');
+  const plannedSnapshot = projectSnapshot([remote]);
+  plannedSnapshot.captured_at = '2026-08-12T10:00:00.0000002Z';
+  const plannedSnapshotPath = await writeSnapshot(directory, plannedSnapshot);
+
+  try {
+    await cliMain([
+      'pull', '--plan', '--snapshot', plannedSnapshotPath,
+      '--plan-receipt', receiptPath, '--env', envPath,
+    ], environment('TASK_CONTROL.json'));
+    const beforeState = await readFile(statePath, 'utf8');
+    const applyRemote = { ...remote, due_on: '2026-08-13' };
+    const applySnapshot = projectSnapshot([applyRemote]);
+    applySnapshot.captured_at = '2026-08-12T10:00:00.0000003Z';
+    const applySnapshotPath = join(directory, 'apply-snapshot.json');
+    await writeFile(applySnapshotPath, `${JSON.stringify(applySnapshot, null, 2)}\n`, 'utf8');
+
+    const report = await cliMain([
+      'pull', '--apply', '--go', 'GO_PULL', '--snapshot', applySnapshotPath,
+      '--plan-receipt', receiptPath, '--env', envPath,
+    ], environment('TASK_CONTROL.json'));
+    assert.equal(report.blocked, true);
+    assert.equal(report.reason, 'state_changed_after_plan');
+    assert.equal(await readFile(statePath, 'utf8'), beforeState);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('stale snapshots stop pull, push, bind, and import before any state or artifact write', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'asana-task-sync-stale-snapshot-no-write-'));
+  const statePath = join(directory, 'TASK_CONTROL.json');
+  const envPath = join(directory, 'TASK_CONTROL.env');
+  const receiptPath = join(directory, 'plan-receipt.json');
+  const controlState = attachRuntime(state());
+  const controlledTask = task();
+  controlState.tasks = [controlledTask];
+  const remote = remoteFromTask(controlState, controlledTask);
+  const beforeState = `${JSON.stringify(controlState, null, 2)}\n`;
+  const beforeReceipt = 'existing receipt must remain untouched\n';
+  await writeFile(statePath, beforeState, 'utf8');
+  await writeFile(receiptPath, beforeReceipt, 'utf8');
+  const stale = projectSnapshot([remote]);
+  stale.captured_at = new Date(Date.now() - 301_000).toISOString();
+  const snapshotPath = await writeSnapshot(directory, stale);
+
+  try {
+    const requests = [
+      ['pull', '--plan', '--snapshot', snapshotPath, '--plan-receipt', receiptPath, '--env', envPath],
+      ['push', '--plan', '--snapshot', snapshotPath, '--plan-receipt', receiptPath, '--env', envPath],
+      [
+        'bind', '--plan', '--task', 'task-1', '--gid', 'asana-1',
+        '--snapshot', snapshotPath, '--plan-receipt', receiptPath, '--env', envPath,
+      ],
+    ];
+    for (const request of requests) {
+      await assert.rejects(
+        cliMain(request, environment('TASK_CONTROL.json')),
+        /the snapshot is too old.*300 seconds maximum age.*Fetch a new snapshot from Asana/,
+      );
+      assert.equal(await readFile(statePath, 'utf8'), beforeState);
+      assert.equal(await readFile(receiptPath, 'utf8'), beforeReceipt);
+    }
+
+    for (const invalidCapturedAt of [
+      '',
+      'not-a-date',
+      new Date(Date.now() + 61_000).toISOString(),
+    ]) {
+      const invalidTimeSnapshot = projectSnapshot([remote]);
+      invalidTimeSnapshot.captured_at = invalidCapturedAt;
+      await writeFile(snapshotPath, `${JSON.stringify(invalidTimeSnapshot, null, 2)}\n`, 'utf8');
+      await assert.rejects(
+        cliMain([
+          'pull', '--plan', '--snapshot', snapshotPath,
+          '--plan-receipt', receiptPath, '--env', envPath,
+        ], environment('TASK_CONTROL.json')),
+        /Invalid MCP snapshot captured_at.*Fetch a new snapshot from Asana/,
+      );
+      assert.equal(await readFile(statePath, 'utf8'), beforeState);
+      assert.equal(await readFile(receiptPath, 'utf8'), beforeReceipt);
+    }
+
+    const ambiguousOffsetSnapshot = projectSnapshot([remote]);
+    ambiguousOffsetSnapshot.captured_at = '2026-08-12T10:00:00-00:00';
+    await writeFile(snapshotPath, `${JSON.stringify(ambiguousOffsetSnapshot, null, 2)}\n`, 'utf8');
+    let ambiguousOffsetReport;
+    await assert.rejects(
+      async () => {
+        ambiguousOffsetReport = await cliMain([
+          'push', '--plan', '--snapshot', snapshotPath,
+          '--plan-receipt', receiptPath, '--env', envPath,
+        ], environment('TASK_CONTROL.json'));
+      },
+      /captured_at.*-00:00.*unknown local timezone offset.*unambiguous instant.*Fetch a new snapshot from Asana/,
+    );
+    assert.equal(ambiguousOffsetReport, undefined);
+    assert.equal(await readFile(statePath, 'utf8'), beforeState);
+    assert.equal(await readFile(receiptPath, 'utf8'), beforeReceipt);
+
+    await writeFile(snapshotPath, `${JSON.stringify(stale, null, 2)}\n`, 'utf8');
+
+    const importDirectory = join(directory, 'import-output');
+    const importStatePath = join(importDirectory, 'IMPORT_TASK_CONTROL.json');
+    const importEnvPath = join(importDirectory, 'IMPORT_TASK_CONTROL.env');
+    await assert.rejects(
+      cliMain([
+        'import', '--plan', '--name', 'IMPORT', '--output-dir', importDirectory,
+        '--section', 'TO DO', '--snapshot', snapshotPath, '--env', importEnvPath,
+      ], environment('unused.json')),
+      /the snapshot is too old.*300 seconds maximum age.*Fetch a new snapshot from Asana/,
+    );
+    await assert.rejects(
+      cliMain([
+        'import', '--apply', '--go', 'GO_IMPORT', '--name', 'IMPORT',
+        '--output-dir', importDirectory, '--section', 'TO DO',
+        '--snapshot', snapshotPath, '--env', importEnvPath,
+      ], environment('unused.json')),
+      /the snapshot is too old.*300 seconds maximum age.*Fetch a new snapshot from Asana/,
+    );
+    await assert.rejects(stat(importStatePath), { code: 'ENOENT' });
+    await assert.rejects(stat(importDirectory), { code: 'ENOENT' });
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('bind, pull, and push apply reject equal or older snapshot times without writing JSON', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'asana-task-sync-apply-snapshot-time-'));
+  const statePath = join(directory, 'TASK_CONTROL.json');
+  const envPath = join(directory, 'TASK_CONTROL.env');
+  const controlState = attachRuntime(state());
+  const controlledTask = task();
+  const remote = remoteFromTask(controlState, controlledTask);
+  controlState.tasks = [controlledTask];
+  await writeFile(statePath, `${JSON.stringify(controlState, null, 2)}\n`, 'utf8');
+  const snapshotPath = await writeSnapshot(directory, snapshot([remote]));
+
+  try {
+    for (const operation of ['pull', 'push']) {
+      const receiptPath = join(directory, `${operation}-plan-receipt.json`);
+      const plan = await cliMain([
+        operation, '--plan', '--snapshot', snapshotPath,
+        '--plan-receipt', receiptPath, '--env', envPath,
+      ], environment('TASK_CONTROL.json'));
+      const beforeState = await readFile(statePath, 'utf8');
+      const beforeReceipt = await readFile(receiptPath, 'utf8');
+      const receipt = JSON.parse(beforeReceipt);
+      assert.equal(plan.snapshot_captured_at, receipt.snapshot_captured_at);
+      assert.equal(plan.snapshot_max_age_seconds, 300);
+
+      await assert.rejects(
+        cliMain([
+          operation, '--apply', '--go', `GO_${operation.toUpperCase()}`,
+          '--snapshot', snapshotPath, '--plan-receipt', receiptPath, '--env', envPath,
+        ], environment('TASK_CONTROL.json')),
+        /must be strictly later.*Fetch a new snapshot from Asana.*same receipt/,
+      );
+
+      const older = JSON.parse(await readFile(snapshotPath, 'utf8'));
+      older.captured_at = new Date(Date.parse(receipt.snapshot_captured_at) - 1000).toISOString();
+      const olderPath = join(directory, `${operation}-older-snapshot.json`);
+      await writeFile(olderPath, `${JSON.stringify(older, null, 2)}\n`, 'utf8');
+      await assert.rejects(
+        cliMain([
+          operation, '--apply', '--go', `GO_${operation.toUpperCase()}_OLDER`,
+          '--snapshot', olderPath, '--plan-receipt', receiptPath, '--env', envPath,
+        ], environment('TASK_CONTROL.json')),
+        /must be strictly later.*Fetch a new snapshot from Asana.*same receipt/,
+      );
+      assert.equal(await readFile(statePath, 'utf8'), beforeState);
+      assert.equal(await readFile(receiptPath, 'utf8'), beforeReceipt);
+    }
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+
+  const fixture = await unboundFixture('asana-task-sync-bind-apply-snapshot-time-');
+  try {
+    await cliMain([
+      'bind', '--plan', '--task', 'task-1', '--gid', 'asana-existing',
+      '--snapshot', fixture.snapshotPath, '--plan-receipt', fixture.planReceiptPath,
+      '--env', fixture.envPath,
+    ], environment('TASK_CONTROL.json'));
+    const beforeState = await readFile(fixture.statePath, 'utf8');
+    const beforeReceipt = await readFile(fixture.planReceiptPath, 'utf8');
+    const receipt = JSON.parse(beforeReceipt);
+    await assert.rejects(
+      cliMain([
+        'bind', '--apply', '--go', 'GO_BIND', '--task', 'task-1', '--gid', 'asana-existing',
+        '--snapshot', fixture.snapshotPath, '--plan-receipt', fixture.planReceiptPath,
+        '--env', fixture.envPath,
+      ], environment('TASK_CONTROL.json')),
+      /must be strictly later.*Fetch a new snapshot from Asana.*same receipt/,
+    );
+    const older = projectSnapshot([fixture.remote]);
+    older.captured_at = new Date(Date.parse(receipt.snapshot_captured_at) - 1000).toISOString();
+    const olderPath = join(fixture.directory, 'bind-older-snapshot.json');
+    await writeFile(olderPath, `${JSON.stringify(older, null, 2)}\n`, 'utf8');
+    await assert.rejects(
+      cliMain([
+        'bind', '--apply', '--go', 'GO_BIND_OLDER', '--task', 'task-1', '--gid', 'asana-existing',
+        '--snapshot', olderPath, '--plan-receipt', fixture.planReceiptPath,
+        '--env', fixture.envPath,
+      ], environment('TASK_CONTROL.json')),
+      /must be strictly later.*Fetch a new snapshot from Asana.*same receipt/,
+    );
+    assert.equal(await readFile(fixture.statePath, 'utf8'), beforeState);
+    assert.equal(await readFile(fixture.planReceiptPath, 'utf8'), beforeReceipt);
+  } finally {
+    await rm(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test('apply rejects a legacy receipt without snapshot_captured_at and requires a new plan', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'asana-task-sync-legacy-time-receipt-'));
+  const statePath = join(directory, 'TASK_CONTROL.json');
+  const envPath = join(directory, 'TASK_CONTROL.env');
+  const receiptPath = join(directory, 'pull-plan-receipt.json');
+  const controlState = attachRuntime(state());
+  const controlledTask = task();
+  const remote = remoteFromTask(controlState, controlledTask);
+  controlState.tasks = [controlledTask];
+  await writeFile(statePath, `${JSON.stringify(controlState, null, 2)}\n`, 'utf8');
+  const snapshotPath = await writeSnapshot(directory, snapshot([remote]));
+
+  try {
+    await cliMain([
+      'pull', '--plan', '--snapshot', snapshotPath, '--plan-receipt', receiptPath,
+      '--env', envPath,
+    ], environment('TASK_CONTROL.json'));
+    const receipt = JSON.parse(await readFile(receiptPath, 'utf8'));
+    const fresh = JSON.parse(await readFile(snapshotPath, 'utf8'));
+    fresh.captured_at = new Date(Date.parse(receipt.snapshot_captured_at) + 1000).toISOString();
+    const freshPath = join(directory, 'fresh-apply-snapshot.json');
+    await writeFile(freshPath, `${JSON.stringify(fresh, null, 2)}\n`, 'utf8');
+    delete receipt.snapshot_captured_at;
+    await writeFile(receiptPath, `${JSON.stringify(receipt, null, 2)}\n`, 'utf8');
+    const beforeState = await readFile(statePath, 'utf8');
+    await assert.rejects(
+      cliMain([
+        'pull', '--apply', '--go', 'GO_PULL', '--snapshot', freshPath,
+        '--plan-receipt', receiptPath, '--env', envPath,
+      ], environment('TASK_CONTROL.json')),
+      /lacks snapshot_captured_at.*cannot prove snapshot freshness.*new --plan.*fresh snapshot from Asana/,
+    );
+    assert.equal(await readFile(statePath, 'utf8'), beforeState);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('apply rejects a receipt snapshot_captured_at with the unknown -00:00 offset without writing', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'asana-task-sync-ambiguous-time-receipt-'));
+  const statePath = join(directory, 'TASK_CONTROL.json');
+  const envPath = join(directory, 'TASK_CONTROL.env');
+  const receiptPath = join(directory, 'pull-plan-receipt.json');
+  const controlState = attachRuntime(state());
+  const controlledTask = task();
+  const remote = remoteFromTask(controlState, controlledTask);
+  controlState.tasks = [controlledTask];
+  await writeFile(statePath, `${JSON.stringify(controlState, null, 2)}\n`, 'utf8');
+  const snapshotPath = await writeSnapshot(directory, snapshot([remote]));
+
+  try {
+    await cliMain([
+      'pull', '--plan', '--snapshot', snapshotPath, '--plan-receipt', receiptPath,
+      '--env', envPath,
+    ], environment('TASK_CONTROL.json'));
+    const receipt = JSON.parse(await readFile(receiptPath, 'utf8'));
+    const fresh = JSON.parse(await readFile(snapshotPath, 'utf8'));
+    fresh.captured_at = new Date(Date.parse(receipt.snapshot_captured_at) + 1000).toISOString();
+    const freshPath = join(directory, 'fresh-apply-snapshot.json');
+    await writeFile(freshPath, `${JSON.stringify(fresh, null, 2)}\n`, 'utf8');
+    receipt.snapshot_captured_at = '2026-08-12T10:00:00-00:00';
+    const ambiguousReceipt = `${JSON.stringify(receipt, null, 2)}\n`;
+    await writeFile(receiptPath, ambiguousReceipt, 'utf8');
+    const beforeState = await readFile(statePath, 'utf8');
+    let ambiguousReceiptReport;
+    await assert.rejects(
+      async () => {
+        ambiguousReceiptReport = await cliMain([
+          'pull', '--apply', '--go', 'GO_PULL', '--snapshot', freshPath,
+          '--plan-receipt', receiptPath, '--env', envPath,
+        ], environment('TASK_CONTROL.json'));
+      },
+      /Plan receipt has invalid snapshot_captured_at "2026-08-12T10:00:00-00:00".*cannot prove snapshot freshness.*new --plan.*fresh snapshot from Asana/,
+    );
+    assert.equal(ambiguousReceiptReport, undefined);
+    assert.equal(await readFile(statePath, 'utf8'), beforeState);
+    assert.equal(await readFile(receiptPath, 'utf8'), ambiguousReceipt);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('a newer captured_at changes only freshness evidence, not task classification or receipt projections', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'asana-task-sync-freshness-not-domain-hash-'));
+  const statePath = join(directory, 'TASK_CONTROL.json');
+  const envPath = join(directory, 'TASK_CONTROL.env');
+  const firstReceiptPath = join(directory, 'first-plan-receipt.json');
+  const secondReceiptPath = join(directory, 'second-plan-receipt.json');
+  const controlState = attachRuntime(state());
+  const controlledTask = task();
+  const remote = remoteFromTask(controlState, controlledTask);
+  establishBaseline(controlState, controlledTask, remote);
+  controlState.tasks = [controlledTask];
+  await writeFile(statePath, `${JSON.stringify(controlState, null, 2)}\n`, 'utf8');
+  const firstSnapshot = snapshot([remote]);
+  const firstSnapshotPath = await writeSnapshot(directory, firstSnapshot);
+
+  try {
+    const firstPlan = await cliMain([
+      'pull', '--plan', '--snapshot', firstSnapshotPath,
+      '--plan-receipt', firstReceiptPath, '--env', envPath,
+    ], environment('TASK_CONTROL.json'));
+    const secondSnapshot = snapshot([remote]);
+    secondSnapshot.captured_at = new Date(Date.parse(firstSnapshot.captured_at) + 1).toISOString();
+    const secondSnapshotPath = join(directory, 'second-snapshot.json');
+    await writeFile(secondSnapshotPath, `${JSON.stringify(secondSnapshot, null, 2)}\n`, 'utf8');
+    const secondPlan = await cliMain([
+      'pull', '--plan', '--snapshot', secondSnapshotPath,
+      '--plan-receipt', secondReceiptPath, '--env', envPath,
+    ], environment('TASK_CONTROL.json'));
+    const firstReceipt = JSON.parse(await readFile(firstReceiptPath, 'utf8'));
+    const secondReceipt = JSON.parse(await readFile(secondReceiptPath, 'utf8'));
+
+    assert.deepEqual(secondPlan.tasks, firstPlan.tasks);
+    assert.equal(secondPlan.tasks[0].action, 'synchronized');
+    assert.deepEqual(secondReceipt.tasks, firstReceipt.tasks);
+    assert.notEqual(secondReceipt.snapshot_captured_at, firstReceipt.snapshot_captured_at);
+    assert.equal(secondPlan.snapshot_captured_at, secondReceipt.snapshot_captured_at);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
@@ -1964,11 +2423,15 @@ test('two host copies reconcile independently only from fresh Asana snapshots', 
     assert.equal(Object.hasOwn(savedA, 'synchronization'), false);
 
     assert.equal(await readFile(stateBPath, 'utf8'), initialJson);
-    const staleSnapshotBPath = await writeSnapshot(hostB, snapshot([initialRemote]));
-    const stalePlanB = await main([
-      'pull', '--plan', '--snapshot', staleSnapshotBPath, '--env', envBPath,
-    ], environment('TASK_CONTROL.json'));
-    assert.equal(stalePlanB.tasks[0].action, 'synchronized');
+    const staleSnapshotB = snapshot([initialRemote]);
+    staleSnapshotB.captured_at = new Date(Date.now() - 2 * 24 * 60 * 60 * 1000).toISOString();
+    const staleSnapshotBPath = await writeSnapshot(hostB, staleSnapshotB);
+    await assert.rejects(
+      cliMain([
+        'pull', '--plan', '--snapshot', staleSnapshotBPath, '--env', envBPath,
+      ], environment('TASK_CONTROL.json')),
+      /the snapshot is too old.*300 seconds maximum age.*Fetch a new snapshot from Asana/,
+    );
     assert.equal(await readFile(stateBPath, 'utf8'), initialJson);
 
     const foreignSnapshot = snapshot([remoteAfterA]);
@@ -2003,6 +2466,8 @@ test('two host copies reconcile independently only from fresh Asana snapshots', 
     ], environment('TASK_CONTROL.json'));
     assert.equal(blockedB.blocked, true);
     assert.equal(blockedB.reason, 'state_changed_after_plan');
+    assert.equal(Date.parse(blockedB.snapshot_captured_at) > Date.parse(planB.snapshot_captured_at), true);
+    assert.equal(blockedB.snapshot_max_age_seconds, 300);
     assert.equal(blockedB.decision_required_diff.some(({ field }) => field === 'due_on'), true);
     assert.equal(await readFile(stateBPath, 'utf8'), initialJson);
 

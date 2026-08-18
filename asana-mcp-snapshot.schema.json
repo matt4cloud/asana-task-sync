@@ -6,7 +6,12 @@
   "required": ["schema_version", "captured_at", "target", "sections", "scope", "tasks"],
   "properties": {
     "schema_version": { "const": "asana-mcp-snapshot/v1" },
-    "captured_at": { "type": "string", "format": "date-time" },
+    "captured_at": {
+      "type": "string",
+      "format": "date-time",
+      "minLength": 1,
+      "description": "Time when the agent completed this Asana observation. The CLI accepts snapshots up to 300 seconds old, tolerates at most 60 seconds of future clock skew, and requires bind/pull/push apply snapshots to be strictly later than the matching plan snapshot. This is distinct from each task's modified_at."
+    },
     "target": {
       "type": "object",
       "required": ["project"],
@@ -108,7 +113,10 @@
         "notes": { "type": "string" },
         "completed": { "type": "boolean" },
         "due_on": { "type": ["string", "null"] },
-        "modified_at": { "type": ["string", "null"] },
+        "modified_at": {
+          "type": ["string", "null"],
+          "description": "Asana's last-modified time for this task, preserved as asana.last_seen_at; it is not the time when the snapshot was captured."
+        },
         "assignee": {
           "oneOf": [
             { "$ref": "#/$defs/assignee" },

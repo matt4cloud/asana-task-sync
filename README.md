@@ -59,6 +59,25 @@ neutral example in [examples/asana-mcp-snapshot.example.json](examples/asana-mcp
 Snapshots are host runtime artifacts, not secrets, but may contain task content;
 keep them outside a repository or ignore them locally.
 
+Every snapshot operation validates the top-level `captured_at` before task
+classification, receipt creation, MCP-manifest generation, or a JSON write.
+It must be an unambiguous RFC 3339 date-time no more than 300 seconds old and
+no more than 60 seconds in the future. These fixed safety limits cannot be
+relaxed through the environment or CLI. The static example file illustrates
+the JSON shape only; its historical `captured_at` makes it intentionally
+unsuitable for a real operation.
+
+`captured_at` is an agent-supplied declaration, not a signed MCP receipt. The
+guard prevents accidental or procedural reuse of old files; it cannot detect
+a manually falsified time or a dishonest snapshot producer. Solving that
+would require a direct or cryptographically authenticated integration and is
+outside this release.
+
+`captured_at` is the time when the agent performed the snapshot observation.
+It is distinct from each task's `modified_at`, which is Asana's time of the
+task's last change. The latter is preserved as local `asana.last_seen_at`; it
+does not prove when the agent last checked Asana.
+
 `scope.kind: "project"` explicitly proves that `tasks` contains the full
 configured project. `scope.kind: "tasks"` remains valid for ordinary limited
 pull/push work, and `scope.kind: "section"` remains the import boundary, but
@@ -74,9 +93,16 @@ Agent configured with Asana MCP
         │
         └── after explicit GO:
               operation manifest → agent performs MCP writes
-              → fresh MCP receipt snapshot → asana-task-sync --apply
+              → new MCP receipt snapshot captured after the plan
+              → asana-task-sync --apply
               → durable local JSON
 ```
+
+Receipts created by `bind --plan`, `pull --plan`, and `push --plan` record
+`snapshot_captured_at`. Their matching `--apply` requires a still-valid
+snapshot whose `captured_at` is strictly later. Reusing the plan snapshot, a
+copy with the same time, or an older observation is rejected without writing.
+Legacy receipts without `snapshot_captured_at` must be replaced by a new plan.
 
 ## Installation and host integration
 
@@ -269,6 +295,11 @@ field-level `decision_required_diff`; JSON is not written. The operator must
 resolve the shown difference, after which the agent creates a new plan and
 receipt. A conflict or an incomplete snapshot also produces no write.
 
+Every successful snapshot-based report includes `snapshot_captured_at` and
+`snapshot_max_age_seconds`. A task reported as `synchronized` is therefore
+confirmed only against the snapshot identified by that report, never as an
+open-ended claim that Asana remains current.
+
 When a plan reports a controlled-projection conflict and the operator explicitly
 decides that JSON is authoritative, the agent records that decision in a new
 scoped push plan using `--resolve json`. Only then does the plan emit the MCP
@@ -334,9 +365,11 @@ the operator-notes suffix.
 
 Each host copy has its own synchronization baseline. Per-task `sync_status`,
 hashes, and `last_seen_at` describe only what that local JSON copy last
-observed. A fresh Asana snapshot and the matching plan receipt reconcile that
-copy; no database-wide timestamp, host identity, or status can prove that
-Asana, remote mapping, or another host copy is current.
+observed. In particular, `last_seen_at` preserves the task's Asana
+`modified_at`; it is not the snapshot or check time. A fresh Asana snapshot
+and the matching plan receipt reconcile that copy; no database-wide timestamp,
+host identity, per-task `sync_status`, or hash can prove that Asana, remote
+mapping, or another host copy is current.
 
 The optional `synchronization.conflicts` array remains host-owned conflict
 metadata. Older databases may also contain legacy database-wide reconciliation
