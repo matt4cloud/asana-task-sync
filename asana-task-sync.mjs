@@ -1151,7 +1151,7 @@ function plannedMcpCreate(state, task) {
     task: {
       name: desired.name,
       notes: desired.notes,
-      due_on: desired.due_on,
+      ...(desired.due_on === null ? {} : { due_on: desired.due_on }),
       completed: desired.completed,
       assignee,
       ...(isSubtask

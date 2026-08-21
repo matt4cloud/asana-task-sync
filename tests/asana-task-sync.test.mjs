@@ -1597,6 +1597,88 @@ test('push plan emits MCP operations and push apply only reconciles an MCP recei
   }
 });
 
+test('create manifests omit an absent due date while updates retain and can clear it', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'asana-task-sync-due-on-manifest-'));
+  const statePath = join(directory, 'TASK_CONTROL.json');
+  const envPath = join(directory, 'TASK_CONTROL.env');
+  const planReceiptPath = join(directory, 'create-plan-receipt.json');
+  const newControlState = attachRuntime(state([task({
+    asana: {
+      ...task().asana,
+      gid: null,
+      due_on: null,
+      last_synced_plan_sha256: null,
+      last_synced_projection_sha256: null,
+    },
+  })]));
+  const createSnapshotPath = await writeSnapshot(directory, projectSnapshot([]));
+
+  try {
+    await writeFile(statePath, `${JSON.stringify(newControlState, null, 2)}\n`, 'utf8');
+    const createPlan = await main([
+      'push', '--plan', '--snapshot', createSnapshotPath,
+      '--plan-receipt', planReceiptPath, '--env', envPath,
+    ], environment('TASK_CONTROL.json'));
+    const createWithoutDueDate = createPlan.mcp_operations[0];
+    assert.equal(createWithoutDueDate.operation, 'create_task');
+    assert.equal(Object.hasOwn(createWithoutDueDate.task, 'due_on'), false);
+    assert.equal(desiredProjection(newControlState, newControlState.tasks[0]).due_on, null);
+
+    const createdRemote = remoteFromTask(newControlState, newControlState.tasks[0]);
+    createdRemote.gid = 'asana-created-1';
+    const receiptPath = await writeSnapshot(
+      directory,
+      projectSnapshot([createdRemote], [{ local_id: 'task-1', asana_gid: 'asana-created-1' }]),
+    );
+    const createApply = await main([
+      'push', '--apply', '--go', 'GO_CREATE_WITHOUT_DUE_DATE', '--snapshot', receiptPath,
+      '--plan-receipt', planReceiptPath, '--env', envPath,
+    ], environment('TASK_CONTROL.json'));
+    assert.equal(createApply.changed_json, true);
+    const createdState = JSON.parse(await readFile(statePath, 'utf8'));
+    assert.equal(createdState.tasks[0].asana.gid, 'asana-created-1');
+    assert.equal(createdState.tasks[0].asana.due_on, null);
+
+    const datedTask = task({
+      asana: { ...task().asana, gid: null, due_on: '2026-09-15' },
+    });
+    const datedState = state([datedTask]);
+    await writeFile(statePath, `${JSON.stringify(datedState, null, 2)}\n`, 'utf8');
+    const datedCreateSnapshotPath = await writeSnapshot(directory, projectSnapshot([]));
+    const datedPlan = await main([
+      'push', '--plan', '--snapshot', datedCreateSnapshotPath, '--env', envPath,
+    ], environment('TASK_CONTROL.json'));
+    assert.equal(datedPlan.mcp_operations[0].operation, 'create_task');
+    assert.equal(Object.hasOwn(datedPlan.mcp_operations[0].task, 'due_on'), true);
+    assert.equal(datedPlan.mcp_operations[0].task.due_on, '2026-09-15');
+
+    const existingState = attachRuntime(state());
+    const existingTask = task({ asana: { ...task().asana, due_on: '2026-09-15' } });
+    const existingRemote = remoteFromTask(existingState, existingTask);
+    establishBaseline(existingState, existingTask, existingRemote);
+    existingTask.title = 'Updated task keeping its due date';
+    existingState.tasks = [existingTask];
+    await writeFile(statePath, `${JSON.stringify(existingState, null, 2)}\n`, 'utf8');
+    const updateSnapshotPath = await writeSnapshot(directory, snapshot([existingRemote]));
+    const retainedDueDatePlan = await main([
+      'push', '--plan', '--snapshot', updateSnapshotPath, '--env', envPath,
+    ], environment('TASK_CONTROL.json'));
+    assert.equal(retainedDueDatePlan.mcp_operations[0].operation, 'update_task');
+    assert.equal(retainedDueDatePlan.mcp_operations[0].changes.due_on, '2026-09-15');
+
+    existingTask.asana.due_on = null;
+    await writeFile(statePath, `${JSON.stringify(existingState, null, 2)}\n`, 'utf8');
+    const clearDueDatePlan = await main([
+      'push', '--plan', '--snapshot', updateSnapshotPath, '--env', envPath,
+    ], environment('TASK_CONTROL.json'));
+    assert.equal(clearDueDatePlan.mcp_operations[0].operation, 'update_task');
+    assert.equal(Object.hasOwn(clearDueDatePlan.mcp_operations[0].changes, 'due_on'), true);
+    assert.equal(clearDueDatePlan.mcp_operations[0].changes.due_on, null);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test('an explicit JSON-wins resolution turns a controlled conflict into one scoped MCP update', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'asana-task-sync-json-resolution-'));
   const statePath = join(directory, 'TASK_CONTROL.json');
